@@ -91,10 +91,17 @@ Generate a clear, 2-3 sentence explanation for a non-technical user. Focus on wh
         self,
         feature_importance: List[Dict[str, Any]],
         model_name: str,
-        task_type: str = "classification"
+        task_type: str = "classification",
+        method: str = "shap"
     ) -> str:
         """
         Generate a plain-language summary of global feature importance.
+
+        Args:
+            feature_importance: List of {feature, importance} dicts
+            model_name: Name of the model
+            task_type: Type of ML task
+            method: Explanation method ("shap" or "lime")
         """
         top_features = feature_importance[:10]
 
@@ -103,7 +110,9 @@ Generate a clear, 2-3 sentence explanation for a non-technical user. Focus on wh
             for feat in top_features
         ])
 
-        prompt = f"""For the model '{model_name}' (task type: {task_type}), the most important features are:
+        method_desc = "SHAP (SHapley Additive exPlanations)" if method == "shap" else "LIME (Local Interpretable Model-agnostic Explanations)"
+
+        prompt = f"""For the model '{model_name}' (task type: {task_type}), using {method_desc}, the most important features are:
 
 {features_text}
 
@@ -122,10 +131,97 @@ Write a 2-3 sentence summary explaining which factors matter most for this model
                 )
                 return response.choices[0].message.content.strip()
             else:
-                return self._generate_global_template(model_name, task_type, top_features)
+                return self._generate_global_template(model_name, task_type, top_features, method)
 
         except Exception:
-            return self._generate_global_template(model_name, task_type, top_features)
+            return self._generate_global_template(model_name, task_type, top_features, method)
+
+    def generate_lime_explanation(
+        self,
+        lime_weights: List[Dict[str, Any]],
+        feature_names: List[str],
+        feature_values: List[Any],
+        prediction: float,
+        prediction_label: str = None,
+        num_features: int = 5
+    ) -> str:
+        """
+        Generate a plain-language explanation for a LIME-based prediction.
+
+        Args:
+            lime_weights: LIME feature contributions [{feature, weight, value}, ...]
+            feature_names: Names of all features
+            feature_values: Actual feature values in this prediction
+            prediction: Model's prediction
+            prediction_label: Classification label
+            num_features: Number of top features to include
+
+        Returns:
+            Natural language explanation string
+        """
+        # Sort by absolute weight
+        sorted_weights = sorted(lime_weights, key=lambda x: abs(x.get("weight", 0)), reverse=True)[:num_features]
+
+        contributions = []
+        for item in sorted_weights:
+            feature_name = item.get("feature", "Unknown")
+            weight = item.get("weight", 0)
+            feature_value = item.get("value", "N/A")
+            direction = "increased" if weight > 0 else "decreased"
+            contributions.append(f"- {feature_name}: {feature_value} (impact: {weight:+.4f}) — this {direction} the prediction")
+
+        contributions_text = "\n".join(contributions)
+
+        if prediction_label:
+            prompt = f"""The model predicted: {prediction_label} with a score of {prediction:.4f}.
+
+The top contributing factors according to LIME are:
+{contributions_text}
+
+Generate a clear, 2-3 sentence explanation for a non-technical user. Focus on what factors were most important and whether they increased or decreased the prediction. Mention that this explanation uses LIME, which creates a local interpretable model around this prediction."""
+        else:
+            prompt = f"""The model predicted a value of {prediction:.4f}.
+
+The top contributing factors according to LIME are:
+{contributions_text}
+
+Generate a clear, 2-3 sentence explanation for a non-technical user. Focus on what factors were most important and whether they increased or decreased the prediction. Mention that this explanation uses LIME, which creates a local interpretable model around this prediction."""
+
+        try:
+            if self.client:
+                response = self.client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are an AI explainability expert that makes technical LIME explanations understandable to everyday users."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=200
+                )
+                return response.choices[0].message.content.strip()
+            else:
+                return self._generate_lime_template(prediction, contributions_text, prediction_label)
+
+        except Exception:
+            return self._generate_lime_template(prediction, contributions_text, prediction_label)
+
+    def _generate_global_template(
+        self,
+        model_name: str,
+        task_type: str,
+        top_features: List[Dict[str, Any]],
+        method: str = "shap"
+    ) -> str:
+        """Generate a template-based global explanation without LLM."""
+        method_name = "SHAP" if method == "shap" else "LIME"
+
+        if not top_features:
+            return f"The model '{model_name}' does not have clear feature importance information available from {method_name}."
+
+        top_feature = top_features[0]['feature']
+        return f"For the '{model_name}' model, using {method_name}, '{top_feature}' is the most important feature, followed by {top_features[1]['feature'] if len(top_features) > 1 else 'others'}.
+
+These features have the largest impact on the model's predictions across all data points. Understanding these key drivers helps ensure the model is making decisions for the right reasons."
 
     def _generate_template_explanation(
         self,

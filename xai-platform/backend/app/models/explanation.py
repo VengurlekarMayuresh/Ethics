@@ -10,7 +10,12 @@ class ExplanationBase(BaseModel):
     shap_values: Optional[List[List[float]]] = None
     expected_value: Optional[float] = None
     feature_names: Optional[List[str]] = None
-    lime_weights: Optional[List[List[float]]] = None
+    # LIME fields
+    lime_weights: Optional[List[Dict[str, Any]]] = None
+    lime_intercept: Optional[float] = None
+    lime_local_pred: Optional[float] = None
+    lime_global_importance: Optional[List[Dict[str, Any]]] = None
+    # Shared
     nl_explanation: Optional[str] = None
     task_id: Optional[str] = None
     task_status: str = "pending"  # "pending" | "complete" | "failed"

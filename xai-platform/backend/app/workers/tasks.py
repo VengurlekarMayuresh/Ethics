@@ -4,6 +4,7 @@ import pandas as pd
 from typing import Dict, Any, List, Optional
 from app.celery_app import celery_app
 from app.services.model_loader_service import ModelLoaderService
+from app.services.lime_service import LIMEService
 from app.db.mongo import get_db, storage
 from app.db.repositories.prediction_repository import PredictionRepository
 from datetime import datetime
@@ -155,6 +156,195 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
             explanation_id = str(result.inserted_id)
 
             return {"explanation_id": explanation_id, "status": "complete", "feature_importance": feature_importance}
+
+        return asyncio.run(async_task())
+
+    except Exception as e:
+        self.update_state(state="FAILURE", meta={"status": "failed", "error": str(e)})
+        raise
+
+@celery_app.task(bind=True, name="compute_lime_values")
+def compute_lime_values(self, prediction_id: str, model_id: str, num_features: int = 10) -> Dict[str, Any]:
+    """
+    Async task to compute LIME explanation for a prediction.
+    """
+    try:
+        self.update_state(state="PROGRESS", meta={"status": "loading model", "progress": 10})
+
+        import asyncio
+        async def async_task():
+            from app.db.mongo import connect_db
+            await connect_db()
+
+            db = get_db()
+
+            # Get prediction record
+            prediction = await db.predictions.find_one({"_id": ObjectId(prediction_id)})
+            if not prediction:
+                raise ValueError(f"Prediction {prediction_id} not found")
+
+            # Get model record
+            model = await db.models.find_one({"_id": ObjectId(model_id)})
+            if not model:
+                raise ValueError(f"Model {model_id} not found")
+
+            self.update_state(state="PROGRESS", meta={"status": "loading model file", "progress": 30})
+
+            # Load model from storage
+            model_obj, framework = await ModelLoaderService.load_model(model["file_path"])
+
+            # Get training data for LIME background
+            # Use sample from prediction data or stored background data
+            if model.get("background_data_path"):
+                bg_bytes = await storage.download_file(model["background_data_path"])
+                training_df = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
+            else:
+                # Use prediction data as minimal background (not ideal but fallback)
+                training_df = pd.DataFrame([prediction["input_data"]])
+                # Add some noise perturbations for LIME background
+                training_df = pd.concat([training_df] * 100, ignore_index=True)
+
+            # Determine mode
+            mode = "classification" if model.get("task_type") in ["classification", "binary_classification", "multiclass_classification"] else "regression"
+
+            self.update_state(state="PROGRESS", meta={"status": "creating LIME explainer", "progress": 50})
+
+            # Create explainer
+            explainer = LIMEService.create_explainer(
+                model_obj,
+                framework,
+                training_df,
+                list(training_df.columns),
+                mode=mode
+            )
+
+            # Prepare input instance
+            input_df = pd.DataFrame([prediction["input_data"]])
+            input_values = input_df.values[0]
+
+            self.update_state(state="PROGRESS", meta={"status": "computing LIME values", "progress": 70})
+
+            # Compute LIME explanation
+            lime_data = LIMEService.explain_instance(
+                explainer,
+                model_obj,
+                input_values,
+                num_features=num_features
+            )
+
+            self.update_state(state="PROGRESS", meta={"status": "saving results", "progress": 90})
+
+            # Save explanation to database
+            explanation_doc = {
+                "prediction_id": prediction_id,
+                "model_id": model_id,
+                "method": "lime",
+                "explanation_type": "local",
+                "lime_weights": lime_data.get("list_of_contributions", []),
+                "lime_intercept": lime_data.get("intercept"),
+                "lime_local_pred": lime_data.get("local_pred"),
+                "feature_names": list(input_df.columns),
+                "nl_explanation": None,
+                "task_id": self.request.id,
+                "task_status": "complete",
+                "created_at": datetime.utcnow()
+            }
+
+            result = await db.explanations.insert_one(explanation_doc)
+            explanation_id = str(result.inserted_id)
+
+            self.update_state(state="SUCCESS", meta={"status": "complete", "explanation_id": explanation_id, "progress": 100})
+
+            return {"explanation_id": explanation_id, "status": "complete"}
+
+        return asyncio.run(async_task())
+
+    except Exception as e:
+        self.update_state(state="FAILURE", meta={"status": "failed", "error": str(e)})
+        raise
+
+@celery_app.task(bind=True, name="compute_global_lime")
+def compute_global_lime(self, model_id: str, background_data_path: Optional[str] = None, num_features: int = 10) -> Dict[str, Any]:
+    """
+    Async task to compute global LIME explanation (aggregated across samples).
+    """
+    try:
+        self.update_state(state="PROGRESS", meta={"status": "loading model", "progress": 10})
+
+        import asyncio
+        async def async_task():
+            from app.db.mongo import connect_db
+            await connect_db()
+
+            db = get_db()
+
+            # Get model record
+            model = await db.models.find_one({"_id": ObjectId(model_id)})
+            if not model:
+                raise ValueError(f"Model {model_id} not found")
+
+            self.update_state(state="PROGRESS", meta={"status": "loading model file", "progress": 30})
+
+            # Load model
+            model_obj, framework = await ModelLoaderService.load_model(model["file_path"])
+
+            # Load background data
+            if not background_data_path:
+                if model.get("background_data_path"):
+                    background_data_path = model["background_data_path"]
+                else:
+                    raise ValueError("Background data required for global LIME computation")
+
+            bg_bytes = await storage.download_file(background_data_path)
+            background_df = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
+
+            self.update_state(state="PROGRESS", meta={"status": "creating LIME explainer", "progress": 50})
+
+            # Determine mode
+            mode = "classification" if model.get("task_type") in ["classification", "binary_classification", "multiclass_classification"] else "regression"
+
+            # Create explainer
+            explainer = LIMEService.create_explainer(
+                model_obj,
+                framework,
+                background_df,
+                list(background_df.columns),
+                mode=mode
+            )
+
+            self.update_state(state="PROGRESS", meta={"status": "computing global LIME", "progress": 60})
+
+            # Compute aggregated LIME importance
+            lime_global = LIMEService.explain_global(
+                explainer,
+                model_obj,
+                background_df,
+                num_features=num_features
+            )
+
+            self.update_state(state="PROGRESS", meta={"status": "saving results", "progress": 100})
+
+            # Save global explanation
+            explanation_doc = {
+                "model_id": model_id,
+                "method": "lime",
+                "explanation_type": "global",
+                "lime_weights": None,  # Individual weights not stored for global
+                "lime_global_importance": lime_global["feature_importance"],
+                "feature_names": list(background_df.columns),
+                # Keep SHAP fields as None to avoid mixing
+                "shap_values": None,
+                "expected_value": None,
+                "global_importance": None,
+                "task_id": self.request.id,
+                "task_status": "complete",
+                "created_at": datetime.utcnow()
+            }
+
+            result = await db.explanations.insert_one(explanation_doc)
+            explanation_id = str(result.inserted_id)
+
+            return {"explanation_id": explanation_id, "status": "complete", "feature_importance": lime_global["feature_importance"]}
 
         return asyncio.run(async_task())
 
