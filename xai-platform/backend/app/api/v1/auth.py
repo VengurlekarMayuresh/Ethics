@@ -3,21 +3,40 @@ from fastapi.security import OAuth2PasswordRequestForm
 from app.models.user import UserCreate, UserResponse, Token
 from app.utils.auth import get_password_hash, verify_password, create_access_token, create_refresh_token, decode_token, oauth2_scheme
 from app.db.mongo import get_db
+from app.db.repositories.api_key_repository import APIKeyRepository
 from datetime import datetime
 from bson import ObjectId
 
 router = APIRouter()
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
+    """
+    Get current user from JWT or API key.
+    """
+    # First try JWT
     payload = decode_token(token)
-    if not payload:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    db = get_db()
-    user = await db.users.find_one({"email": payload.get("sub")})
-    if not user:
+    if payload:
+        db = get_db()
+        user = await db.users.find_one({"email": payload.get("sub")})
+        if user:
+            user["_id"] = str(user["_id"])
+            return user
+        # If JWT valid but user not found, raise
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    user["_id"] = str(user["_id"])
-    return user
+
+    # If not JWT, try API key
+    api_key_data = await APIKeyRepository.verify(token)
+    if api_key_data:
+        db = get_db()
+        user = await db.users.find_one({"_id": ObjectId(api_key_data["user_id"])})
+        if user:
+            user["_id"] = str(user["_id"])
+            return user
+        # API key valid but user not found (shouldn't happen)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+    # Neither valid
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
 
 @router.post("/register", response_model=UserResponse)
 async def register(user: UserCreate):

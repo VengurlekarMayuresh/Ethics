@@ -11,23 +11,27 @@
 - ✅ FastAPI app with health check, CORS, logging middleware
 - ✅ MongoDB connection with Motor async driver
 - ✅ JWT Authentication (register, login, refresh token)
+- ✅ API Key authentication (dual-mode: JWT + API keys)
 - ✅ Model upload endpoint (`.pkl`, `.joblib`, `.onnx`, `.h5`)
 - ✅ MinIO/S3 integration for model file storage
 - ✅ Model metadata schema and CRUD endpoints
-- ✅ Next.js frontend with auth pages (login/register)
+- ✅ Next.js 14 frontend with auth pages (login/register)
 - ✅ Dashboard shell with sidebar navigation
-- ✅ Model upload wizard (drag & drop, validation)
+- ✅ Model upload wizard (drag & drop, validation, multi-step)
+- ✅ Rate limiting middleware (Redis-based, per IP/JWT/API key)
 
 ### Files Created:
 - `backend/app/main.py` - FastAPI entry point
 - `backend/app/config.py` - Settings configuration
 - `backend/app/db/mongo.py` - MongoDB + MinIO clients
-- `backend/app/api/v1/auth.py` - Authentication endpoints
+- `backend/app/api/v1/auth.py` - Authentication endpoints (JWT + API key support)
 - `backend/app/api/v1/models.py` - Model CRUD endpoints
 - `backend/app/models/user.py` - User schemas
 - `backend/app/models/model_meta.py` - Model metadata schemas
+- `backend/app/models/api_key.py` - API key schemas
 - `backend/app/utils/auth.py` - JWT utilities
 - `backend/app/utils/file_handler.py` - MinIO file operations
+- `backend/app/middleware/rate_limit.py` - Rate limiting middleware
 - `frontend/src/app/layout.tsx` - Root layout with auth
 - `frontend/src/app/page.tsx` - Dashboard home
 - `docker-compose.yml` - Full stack orchestration
@@ -38,14 +42,15 @@
 ## Phase 2: Prediction Engine (Weeks 4–5) - ✅ COMPLETED
 
 ### Completed Items:
-- ✅ Model loader service (Framework detection: sklearn, xgboost, onnx, keras)
+- ✅ Model loader service (Framework detection: sklearn, xgboost, onnx, keras, lightgbm)
 - ✅ Prediction endpoint with structured input schema
 - ✅ Dynamic input form generation from model metadata
 - ✅ Prediction result storage in MongoDB
-- ✅ Prediction history page in frontend (API ready)
+- ✅ Prediction history page in frontend (full UI with table view)
 - ✅ Batch prediction support (CSV upload → predictions)
 - ✅ Prediction confidence scores / probability outputs
 - ✅ Repository pattern implementation for all collections
+- ✅ Error handling and validation throughout prediction flow
 
 ### New Files Created:
 - `backend/app/services/prediction_service.py` - Prediction engine
@@ -57,37 +62,47 @@
 - `backend/app/db/repositories/user_repository.py` - User DB operations
 - `backend/app/db/repositories/explanation_repository.py` - Explanation DB operations
 - `backend/app/db/repositories/bias_repository.py` - Bias DB operations
+- `backend/app/db/repositories/api_key_repository.py` - API key DB operations
 - `backend/app/db/repositories/__init__.py` - Repository exports
 
 ---
 
-## Phase 3: Explainability Engine (Weeks 6–9) - 🔄 IN PROGRESS
+## Phase 3: Explainability Engine (Weeks 6–9) - ✅ COMPLETED
 
 ### Completed Items:
 - ✅ SHAP integration for tree-based models (TreeExplainer)
 - ✅ SHAP integration for linear models (LinearExplainer)
 - ✅ SHAP integration for deep models (KernelExplainer)
 - ✅ Celery async tasks for SHAP computation (background jobs)
-- ✅ SHAP local explanation endpoint + SHAP waterfall chart (API ready)
-- ✅ SHAP global explanation endpoint + bar chart (API ready)
+- ✅ SHAP local explanation endpoint + SHAP waterfall chart (API + frontend)
+- ✅ SHAP global explanation endpoint + bar chart + beeswarm plot (API + frontend)
+- ✅ LIME integration (full implementation with LIMEService)
+- ✅ LIME local and global explanation endpoints
 - ✅ Explanation caching in Redis (through Celery backend)
 - ✅ Async task status polling endpoint
+- ✅ NLG service for plain-language explanations (OpenAI GPT integration)
+- ✅ SHAP visualizations: Waterfall plot, Beeswarm plot, Feature importance bar chart
 
-### Partially Completed:
-- 🔄 LIME integration (service defined but needs full implementation)
-- 🔌 LIME local explanation (not yet integrated)
-- 🔌 SHAP beeswarm plot (frontend components not created)
-- 🔌 SHAP dependence plots (not implemented)
-- 🔌 NLG service for plain-language explanations (not implemented)
+### Remaining Items:
+- ❌ Export explanation as PDF report (only JSON/CSV via API)
+- 🔌 SHAP dependence plots (partial dependence, not implemented)
 
 ### New Files Created:
 - `backend/app/workers/celery_app.py` - Celery configuration
-- `backend/app/workers/tasks.py` - Async SHAP computation tasks
-- `backend/app/api/v1/explanations.py` - Explanation endpoints (local + global)
+- `backend/app/workers/tasks.py` - Async SHAP/LIME computation tasks
+- `backend/app/api/v1/explanations.py` - Explanation endpoints (SHAP + LIME, local + global)
+- `backend/app/services/lime_service.py` - LIME explainer service
+- `backend/app/services/nlg_service.py` - Natural language generation service
+- `frontend/src/components/charts/SHAPWaterfall.tsx` - SHAP waterfall visualization
+- `frontend/src/components/charts/SHAPBeeswarm.tsx` - SHAP beeswarm visualization
+- `frontend/src/components/charts/FeatureImportanceBar.tsx` - Bar chart for global importance
+- `frontend/src/components/charts/LIMEPlot.tsx` - LIME feature weights visualization
+- `frontend/src/app/explain/local/[modelId]/[predictionId]/page.tsx` - Local explanation page
+- `frontend/src/app/explain/global/[modelId]/page.tsx` - Global explanation page
 
 ---
 
-## Phase 4: Advanced Analytics (Weeks 10–12) - 🔄 MOSTLY COMPLETE
+## Phase 4: Advanced Analytics (Weeks 10–12) - ✅ COMPLETED
 
 ### Completed Items:
 - ✅ Bias detection service (disparate impact, demographic parity, equal opportunity)
@@ -96,32 +111,37 @@
 - ✅ Model comparison endpoint (side-by-side SHAP importance)
 - ✅ Bias analysis integration with protected/sensitive attributes
 - ✅ Audit logging infrastructure (collections created)
+- ✅ Full frontend implementation of bias dashboard with metrics visualization
+- ✅ Full frontend implementation of model comparison page
 
 ### Remaining Items:
-- 🔌 NLG service — LLM-powered plain-language explanation of SHAP output
-- 🔌 Explanation export (PDF report, JSON, CSV)
-- 🔌 Audit log viewer in frontend
-- 🔌 Notification system (Celery task completion alerts via WebSocket)
+- ❌ Audit log viewer in frontend (backend ready, UI not built)
+- ❌ Notification system (Celery task completion alerts via WebSocket)
 
 ### New Files Created:
 - `backend/app/api/v1/bias.py` - Bias analysis endpoints + metrics computation
 - `backend/app/api/v1/compare.py` - Model comparison endpoints
+- `frontend/src/app/bias/page.tsx` - Bias analysis dashboard UI
+- `frontend/src/app/compare/page.tsx` - Model comparison UI
 
 ---
 
-## Phase 5: API Layer & Polish (Weeks 13–15) - ❌ NOT STARTED
+## Phase 5: API Layer & Polish (Weeks 13–15) - ✅ MOSTLY COMPLETE
+
+### Completed Items:
+- ✅ API key management for external developers (full CRUD)
+- ✅ Rate limiting per API key (Redis-based, tiered limits: anonymous 60, JWT 300, API key 500 req/min)
+- ✅ Auto-generated OpenAPI/Swagger documentation (FastAPI built-in)
+- ✅ Frontend performance optimization (React Query caching, optimized components)
+- ✅ Accessibility considerations (semantic HTML, ARIA labels, keyboard navigation)
 
 ### Remaining Items:
-- ❌ API key management for external developers
-- ❌ Rate limiting per API key (Redis-based)
-- ❌ Auto-generated OpenAPI/Swagger documentation (mostly auto-generated by FastAPI)
 - 🔌 SDK scaffold (Python client library)
-- ❌ Frontend performance optimization (lazy loading, virtualization)
-- ❌ Accessibility audit (WCAG 2.1 AA)
+- ❌ Production Docker Compose with Nginx + SSL (docker-compose.prod.yml not created)
+- 🔌 Kubernetes Helm chart
 - ❌ End-to-end tests (Playwright)
 - ❌ Load testing (Locust)
-- 🔌 Production Docker Compose with Nginx + SSL (docker-compose.prod.yml not created)
-- 🔌 Kubernetes Helm chart
+- ❌ Comprehensive accessibility audit (WCAG 2.1 AA certification)
 
 ---
 
@@ -129,15 +149,18 @@
 
 ### All Endpoints Implemented:
 
-#### Authentication
+#### Authentication & API Keys
 - ✅ POST `/api/v1/auth/register` - Create account
 - ✅ POST `/api/v1/auth/login` - Get JWT token
 - ✅ POST `/api/v1/auth/refresh` - Refresh token
 - ✅ GET `/api/v1/auth/me` - Get current user
+- ✅ GET `/api/v1/api-keys/` - List API keys
+- ✅ POST `/api/v1/api-keys/` - Create API key
+- ✅ DELETE `/api/v1/api-keys/{key_id}` - Revoke API key
 
 #### Models
 - ✅ GET `/api/v1/models` - List user's models
-- ✅ POST `/api/v1/models/upload` - Upload model file
+- ✅ POST `/api/v1/models/upload` - Upload model file (with feature schema)
 - ✅ GET `/api/v1/models/{id}` - Get model details
 - ✅ DELETE `/api/v1/models/{id}` - Delete model
 
@@ -147,11 +170,16 @@
 - ✅ GET `/api/v1/predict/history` - Prediction history
 - ✅ GET `/api/v1/predict/{prediction_id}` - Get prediction result
 
-#### Explanations
+#### Explanations (SHAP + LIME)
 - ✅ POST `/api/v1/explain/local/{model_id}` - Local SHAP explanation (async)
-- ✅ GET `/api/v1/explain/local/{task_id}` - Get async explanation result
+- ✅ GET `/api/v1/explain/local/{task_id}` - Get SHAP explanation result
 - ✅ POST `/api/v1/explain/global/{model_id}` - Global SHAP summary (async)
-- ✅ GET `/api/v1/explain/global/{model_id}/latest` - Get latest global explanation
+- ✅ GET `/api/v1/explain/global/{model_id}/latest` - Get latest SHAP global explanation
+- ✅ POST `/api/v1/explain/lime/{model_id}` - Local LIME explanation (async)
+- ✅ GET `/api/v1/explain/lime/{task_id}` - Get LIME explanation result
+- ✅ POST `/api/v1/explain/lime/global/{model_id}` - Global LIME explanation (async)
+- ✅ GET `/api/v1/explain/lime/global/{model_id}/latest` - Get latest LIME global explanation
+- ✅ GET `/api/v1/explain/prediction/{prediction_id}` - Get latest explanation for prediction
 
 #### Bias & Fairness
 - ✅ POST `/api/v1/bias/analyze` - Run bias analysis
@@ -164,8 +192,8 @@
 - ✅ GET `/api/v1/compare/{comparison_id}` - Get comparison result
 
 #### Missing (Advanced):
-- ❌ POST `/api/v1/explain/{id}/export` - Export explanation as PDF/JSON
-- 🔌 POST `/api/v1/explain/lime` - LIME local explanation
+- ❌ POST `/api/v1/explain/export/{explanation_id}` - Export explanation as PDF/JSON/CSV
+- ❌ POST `/api/v1/bias/generate-report` - Generate PDF compliance report
 
 ---
 

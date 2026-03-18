@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from app.models.model_meta import ModelResponse, FeatureSchema
-from app.api.v1.auth import get_current_user, decode_token, oauth2_scheme
+from app.api.v1.auth import get_current_user
 from app.db.mongo import get_db
 from app.services.prediction_service import ModelLoader, PredictionService
 from app.utils.file_handler import storage
@@ -11,17 +11,6 @@ from typing import List, Dict, Any
 import pandas as pd
 
 router = APIRouter()
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    payload = decode_token(token)
-    if not payload:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    db = get_db()
-    user = await db.users.find_one({"email": payload.get("sub")})
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    user["_id"] = str(user["_id"])
-    return user
 
 @router.post("/{model_id}", response_model=Dict[str, Any])
 async def predict(

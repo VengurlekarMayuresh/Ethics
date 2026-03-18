@@ -71,7 +71,7 @@ export default function LocalExplanationPage() {
   } = useQuery<Explanation>({
     queryKey: ['explanation', predictionId],
     queryFn: async () => {
-      const { data } = await api.get(`/explanations/prediction/${predictionId}`);
+      const { data } = await api.get(`/explain/prediction/${predictionId}`);
       return data;
     },
     enabled: !!predictionId,

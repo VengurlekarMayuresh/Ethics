@@ -1,16 +1,16 @@
 'use client';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Box, Activity, HelpCircle, GitCompare, ShieldAlert, LogOut } from 'lucide-react';
+import { LayoutDashboard, Box, Activity, GitCompare, ShieldAlert, Settings, LogOut } from 'lucide-react';
 import { useStore } from '@/lib/store';
 
 const navItems = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Models', href: '/models', icon: Box },
   { name: 'Predictions', href: '/predict/history', icon: Activity },
-  { name: 'Explain', href: '/explain/local', icon: HelpCircle },
   { name: 'Compare', href: '/compare', icon: GitCompare },
   { name: 'Bias Analysis', href: '/bias', icon: ShieldAlert },
+  { name: 'API Keys', href: '/settings/api-keys', icon: Settings },
 ];
 
 export function Sidebar() {

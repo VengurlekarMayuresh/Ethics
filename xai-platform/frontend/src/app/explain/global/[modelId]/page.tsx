@@ -67,8 +67,8 @@ export default function GlobalExplanationPage() {
     queryKey: ['globalExplanation', modelId, requestMethod],
     queryFn: async () => {
       const endpoint = requestMethod === 'shap'
-        ? `/explanations/global/${modelId}/latest`
-        : `/explanations/lime/global/${modelId}/latest`;
+        ? `/explain/global/${modelId}/latest`
+        : `/explain/lime/global/${modelId}/latest`;
       const { data } = await api.get(endpoint);
       return data;
     },
@@ -89,8 +89,8 @@ export default function GlobalExplanationPage() {
         formData.append('num_features', '10');
       }
       const endpoint = requestMethod === 'shap'
-        ? `/explanations/global/${modelId}`
-        : `/explanations/lime/global/${modelId}`;
+        ? `/explain/global/${modelId}`
+        : `/explain/lime/global/${modelId}`;
       const { data } = await api.post(endpoint, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });

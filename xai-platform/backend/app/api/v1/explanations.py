@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi.responses import FileResponse, StreamingResponse
 from app.models.model_meta import ModelResponse, FeatureSchema
-from app.api.v1.auth import get_current_user, decode_token, oauth2_scheme
+from app.api.v1.auth import get_current_user
 from app.db.mongo import get_db
 from app.workers.celery_app import celery_app
 from app.services.model_loader_service import ModelLoaderService
@@ -10,26 +11,20 @@ from bson import ObjectId
 import json
 from typing import Dict, Any, List, Optional
 import pandas as pd
+import io
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
 router = APIRouter()
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    payload = decode_token(token)
-    if not payload:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    db = get_db()
-    user = await db.users.find_one({"email": payload.get("sub")})
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UUTHORIZED, detail="User not found")
-    user["_id"] = str(user["_id"])
-    return user
 
 @router.post("/local/{model_id}")
 async def request_local_explanation(
     model_id: str,
     file: UploadFile = File(None),
     input_data: str = Form(None),
-    prediction_id: str = Form(None),
+    prediction_id: str = None,  # Can be passed as query param
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -213,7 +208,7 @@ async def request_lime_explanation(
     model_id: str,
     file: UploadFile = File(None),
     input_data: str = Form(None),
-    prediction_id: str = Form(None),
+    prediction_id: str = None,  # optional query param
     num_features: int = Form(10),
     current_user: dict = Depends(get_current_user)
 ):
@@ -419,6 +414,167 @@ async def get_explanation_by_prediction(
             return explanation
         else:
             raise HTTPException(status_code=404, detail="No explanation found for this prediction. Request one first.")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/export/{explanation_id}")
+async def export_explanation(
+    explanation_id: str,
+    format: str = "json",  # "json", "csv", "pdf"
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Export an explanation in various formats (JSON, CSV, PDF).
+    """
+    try:
+        db = get_db()
+
+        # Find the explanation
+        explanation = await db.explanations.find_one({"_id": ObjectId(explanation_id)})
+        if not explanation:
+            raise HTTPException(status_code=404, detail="Explanation not found")
+
+        # Verify model belongs to user
+        model_doc = await db.models.find_one({"_id": ObjectId(explanation["model_id"]), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        # Format the explanation data
+        explanation_data = {
+            "explanation_id": str(explanation["_id"]),
+            "model_id": str(explanation["model_id"]),
+            "model_name": model_doc.get("name", "Unknown"),
+            "method": explanation.get("method", "shap"),
+            "type": explanation.get("explanation_type", "local"),
+            "created_at": explanation["created_at"].isoformat() if isinstance(explanation["created_at"], datetime) else explanation["created_at"],
+            "data": explanation.get("explanation_data", {})
+        }
+
+        if format.lower() == "json":
+            # Return JSON
+            json_data = json.dumps(explanation_data, indent=2, default=str)
+            return StreamingResponse(
+                io.StringIO(json_data),
+                media_type="application/json",
+                headers={"Content-Disposition": f"attachment; filename=explanation_{explanation_id}.json"}
+            )
+
+        elif format.lower() == "csv":
+            # Convert to CSV (for feature importance)
+            output = io.StringIO()
+            if "feature_importance" in explanation.get("explanation_data", {}):
+                df = pd.DataFrame(explanation["explanation_data"]["feature_importance"])
+            elif "shap_values" in explanation.get("explanation_data", {}):
+                # For SHAP values, create a simple table
+                values = explanation["explanation_data"]["shap_values"]
+                features = explanation["explanation_data"].get("feature_names", [])
+                df = pd.DataFrame({
+                    "feature": features if len(features) == len(values) else [f"Feature_{i}" for i in range(len(values))],
+                    "value": values
+                })
+            else:
+                # Generic flattening
+                df = pd.DataFrame([explanation_data["data"]])
+
+            df.to_csv(output, index=False)
+            output.seek(0)
+            return StreamingResponse(
+                io.StringIO(output.getvalue()),
+                media_type="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=explanation_{explanation_id}.csv"}
+            )
+
+        elif format.lower() == "pdf":
+            # Generate PDF report
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=letter)
+            styles = getSampleStyleSheet()
+            story = []
+
+            # Title
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=16,
+                spaceAfter=30
+            )
+            story.append(Paragraph(f"Explanation Report", title_style))
+            story.append(Spacer(1, 12))
+
+            # Metadata
+            story.append(Paragraph(f"<b>Explanation ID:</b> {explanation_id}", styles['Normal']))
+            story.append(Paragraph(f"<b>Model:</b> {model_doc.get('name', 'Unknown')}", styles['Normal']))
+            story.append(Paragraph(f"<b>Method:</b> {explanation.get('method', 'N/A')}", styles['Normal']))
+            story.append(Paragraph(f"<b>Type:</b> {explanation.get('explanation_type', 'N/A')}", styles['Normal']))
+            story.append(Paragraph(f"<b>Generated:</b> {explanation_data['created_at']}", styles['Normal']))
+            story.append(Spacer(1, 20))
+
+            # Add explanation data as table if available
+            data = explanation.get("explanation_data", {})
+            if "feature_importance" in data:
+                story.append(Paragraph("<b>Feature Importance</b>", styles['Heading2']))
+                story.append(Spacer(1, 12))
+
+                # Create table
+                table_data = [["Feature", "Importance"]]
+                for item in data["feature_importance"]:
+                    if isinstance(item, dict):
+                        feature = item.get("feature", str(item))
+                        importance = item.get("importance", 0)
+                    else:
+                        feature = str(item)
+                        importance = 0
+                    table_data.append([feature, f"{importance:.4f}"])
+
+                table = Table(table_data, colWidths=[300, 100])
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 14),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ]))
+                story.append(table)
+
+            elif "shap_values" in data:
+                story.append(Paragraph("<b>SHAP Values</b>", styles['Heading2']))
+                story.append(Spacer(1, 12))
+
+                shap_values = data["shap_values"]
+                feature_names = data.get("feature_names", [f"Feature_{i}" for i in range(len(shap_values))])
+
+                table_data = [["Feature", "SHAP Value"]]
+                for fname, fvalue in zip(feature_names, shap_values):
+                    table_data.append([fname, f"{fvalue:.4f}"])
+
+                table = Table(table_data, colWidths=[300, 100])
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 14),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ]))
+                story.append(table)
+
+            doc.build(story)
+            buffer.seek(0)
+
+            return StreamingResponse(
+                buffer,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"attachment; filename=explanation_{explanation_id}.pdf"}
+            )
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported format: {format}. Supported formats: json, csv, pdf")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
