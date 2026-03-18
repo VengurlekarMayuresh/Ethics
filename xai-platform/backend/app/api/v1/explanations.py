@@ -578,3 +578,97 @@ async def export_explanation(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/dependence/{model_id}")
+async def get_shap_dependence(
+    model_id: str,
+    feature: str,
+    background_data: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get SHAP dependence data for a specific feature.
+    Returns data points for scatter plot with SHAP values vs feature values.
+    Requires background dataset to compute SHAP values.
+    """
+    try:
+        db = get_db()
+
+        # Verify model belongs to user
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        # Read background data
+        contents = await background_data.read()
+        df = pd.read_csv(pd.io.common.BytesIO(contents))
+
+        # Check if feature exists in the dataset
+        if feature not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Feature '{feature}' not found in dataset")
+
+        # Load model
+        model_obj, framework = await ModelLoaderService.load_model(model_doc["file_path"])
+
+        # Prepare features (exclude the target if it's in there? Actually just use all except the feature column itself for prediction)
+        # For SHAP dependence, we need the entire feature matrix
+        feature_columns = [col for col in df.columns if col != feature]
+        X = df[feature_columns]
+
+        # Make predictions to use as target? Actually we don't need y for dependence
+        # We need the full feature matrix including the feature itself
+        X_full = df.copy()
+
+        # Compute SHAP values for background data
+        import shap
+        import numpy as np
+
+        if framework in ["sklearn", "xgboost", "lightgbm"]:
+            explainer = shap.TreeExplainer(model_obj)
+            shap_values = explainer.shap_values(X_full)
+            # For classification, shap_values might be a list (one per class)
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]  # Use positive class for binary classification
+        elif framework == "onnx":
+            # For ONNX, use KernelExplainer with a small subset due to complexity
+            # Or use a simpler approach
+            from shap.maskers import Independent
+            explainer = shap.KernelExplainer(
+                lambda x: model_obj.run(None, {model_obj.get_inputs()[0].name: x.astype(np.float32)})[0],
+                X_full.iloc[:min(100, len(X_full))]  # Use subset for background
+            )
+            shap_values = explainer.shap_values(X_full)
+        else:
+            # Fallback to KernelExplainer for unknown frameworks
+            explainer = shap.KernelExplainer(
+                lambda x: model_obj.predict(pd.DataFrame(x, columns=X_full.columns)),
+                X_full.iloc[:min(100, len(X_full))]
+            )
+            shap_values = explainer.shap_values(X_full)
+
+        # Extract SHAP values for the requested feature
+        if isinstance(shap_values, list):
+            # For multi-class, take mean absolute value across classes
+            shap_vals = np.abs(np.stack(shap_values)).mean(axis=0)
+            # Find feature index in the original column order
+            feature_index = list(X_full.columns).index(feature)
+            shap_feature_values = shap_vals[:, feature_index] if shap_vals.ndim > 1 else shap_vals
+        else:
+            feature_index = list(X_full.columns).index(feature)
+            shap_feature_values = shap_values[:, feature_index] if shap_values.ndim > 1 else shap_values
+
+        # Prepare response data
+        response_data = {
+            "feature": feature,
+            "x_values": df[feature].tolist(),
+            "shap_values": shap_feature_values.tolist(),
+            "x_label": feature,
+            "y_label": "SHAP value",
+            "n_samples": len(df),
+            "method": "shap_dependence"
+        }
+
+        return response_data
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
