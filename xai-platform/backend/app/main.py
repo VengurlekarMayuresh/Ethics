@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.db.mongo import connect_db, close_db
-from app.api.v1 import auth, models, predictions, explanations, bias, compare, api_keys
+from app.api.v1 import auth, models, predictions, explanations, bias, compare, api_keys, audit, notifications
 from app.middleware.rate_limit import RateLimitMiddleware
 
 @asynccontextmanager
@@ -38,4 +38,6 @@ app.include_router(predictions.router, prefix="/api/v1/predict", tags=["Predicti
 app.include_router(explanations.router, prefix="/api/v1/explain", tags=["Explanations"])
 app.include_router(bias.router, prefix="/api/v1/bias", tags=["Bias"])
 app.include_router(compare.router, prefix="/api/v1/compare", tags=["Compare"])
-app.include_router(api_keys.router, prefix="/api/v1/api-keys", tags=["API Keys"])
+app.include_router(api_keys.router, prefix="/api/v1/api-keys", tags=["API Key Management"])
+app.include_router(audit.router, prefix="/api/v1/audit", tags=["Audit"])
+app.include_router(notifications.router, tags=["Notifications"])

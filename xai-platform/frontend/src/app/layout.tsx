@@ -52,13 +52,21 @@ export default function RootLayout({
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased bg-gray-50`}>
         <QueryClientProvider client={queryClient}>
+          {/* Skip navigation link for accessibility */}
+          <a
+            href="#main-content"
+            className="sr-only focus:not-sr-only focus:absolute focus:top-4 focus:left-4 z-50 bg-indigo-600 text-white px-4 py-2 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          >
+            Skip to main content
+          </a>
+
           {isAuthPage ? (
             children
           ) : (
             <div className="flex h-screen overflow-hidden">
               <Sidebar />
               <div className="flex-1 overflow-auto">
-                <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 md:px-8">
+                <main id="main-content" className="mx-auto max-w-7xl px-4 py-8 sm:px-6 md:px-8">
                   {children}
                 </main>
               </div>

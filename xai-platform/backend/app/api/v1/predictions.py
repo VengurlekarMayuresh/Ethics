@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Request
 from app.models.model_meta import ModelResponse, FeatureSchema
 from app.api.v1.auth import get_current_user
 from app.db.mongo import get_db
 from app.services.prediction_service import ModelLoader, PredictionService
 from app.utils.file_handler import storage
+from app.utils.audit_logger import log_action, AuditActions
 from datetime import datetime
 from bson import ObjectId
 import json
@@ -14,6 +15,7 @@ router = APIRouter()
 
 @router.post("/{model_id}", response_model=Dict[str, Any])
 async def predict(
+    request: Request,
     model_id: str,
     file: UploadFile = File(None),
     input_data: str = Form(None),
@@ -68,6 +70,16 @@ async def predict(
 
         result = await db.predictions.insert_one(prediction_doc)
         formatted_result["prediction_id"] = str(result.inserted_id)
+
+        # Log audit event
+        await log_action(
+            user_id=current_user["_id"],
+            action=AuditActions.PREDICTION_CREATE,
+            resource_type="prediction",
+            resource_id=str(result.inserted_id),
+            details={"model_id": model_id, "model_name": model_doc.get("name")},
+            request=request
+        )
 
         return formatted_result
 

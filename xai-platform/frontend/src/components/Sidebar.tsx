@@ -1,7 +1,7 @@
 'use client';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Box, Activity, GitCompare, ShieldAlert, Settings, LogOut } from 'lucide-react';
+import { LayoutDashboard, Box, Activity, GitCompare, ShieldAlert, Settings, LogOut, History } from 'lucide-react';
 import { useStore } from '@/lib/store';
 
 const navItems = [
@@ -10,6 +10,7 @@ const navItems = [
   { name: 'Predictions', href: '/predict/history', icon: Activity },
   { name: 'Compare', href: '/compare', icon: GitCompare },
   { name: 'Bias Analysis', href: '/bias', icon: ShieldAlert },
+  { name: 'Audit Log', href: '/audit', icon: History },
   { name: 'API Keys', href: '/settings/api-keys', icon: Settings },
 ];
 

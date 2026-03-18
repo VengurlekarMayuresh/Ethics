@@ -12,10 +12,13 @@ import {
   AlertCircle,
   CheckCircle,
   FileText,
+  ChevronDown,
+  ScatterChart,
 } from 'lucide-react';
 import Link from 'next/link';
 import FeatureImportanceBar from '@/components/charts/FeatureImportanceBar';
 import SHAPBeeswarm from '@/components/charts/SHAPBeeswarm';
+import SHAPDependence from '@/components/charts/SHAPDependence';
 import { format } from 'date-fns';
 
 interface GlobalExplanation {
@@ -46,6 +49,10 @@ export default function GlobalExplanationPage() {
 
   const [backgroundFile, setBackgroundFile] = useState<File | null>(null);
   const [requestMethod, setRequestMethod] = useState<'shap' | 'lime'>('shap');
+  const [selectedFeature, setSelectedFeature] = useState<string>('');
+  const [dependenceData, setDependenceData] = useState<{ x_values: number[]; shap_values: number[] } | null>(null);
+  const [dependenceFeatureFile, setDependenceFeatureFile] = useState<File | null>(null);
+  const [isLoadingDependence, setIsLoadingDependence] = useState(false);
 
   // Fetch model
   const { data: model, isLoading: modelLoading } = useQuery<Model>({
@@ -112,6 +119,35 @@ export default function GlobalExplanationPage() {
 
   const handleRequest = () => {
     requestGlobal.mutate();
+  };
+
+  const handleFeatureFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      setDependenceFeatureFile(e.target.files[0]);
+    }
+  };
+
+  const loadDependencePlot = async () => {
+    if (!selectedFeature || !dependenceFeatureFile) return;
+
+    setIsLoadingDependence(true);
+    try {
+      const formData = new FormData();
+      formData.append('background_data', dependenceFeatureFile);
+
+      const { data } = await api.post(`/explain/dependence/${modelId}?feature=${encodeURIComponent(selectedFeature)}`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setDependenceData({
+        x_values: data.x_values,
+        shap_values: data.shap_values,
+      });
+    } catch (error: any) {
+      console.error('Failed to fetch dependence data:', error);
+      alert('Failed to load dependence plot: ' + (error.response?.data?.detail || error.message));
+    } finally {
+      setIsLoadingDependence(false);
+    }
   };
 
   const isLoading = modelLoading || explanationLoading || requestGlobal.isPending;
@@ -306,6 +342,87 @@ export default function GlobalExplanationPage() {
               title="SHAP Beeswarm Plot (Global Distribution)"
               height={500}
             />
+          )}
+
+          {/* SHAP Dependence Plot */}
+          {requestMethod === 'shap' && explanation.feature_names && (
+            <div className="rounded-lg border border-gray-200 bg-white p-6">
+              <div className="mb-4">
+                <h3 className="text-lg font-semibold text-gray-900 mb餐2">SHAP Dependence Plots</h3>
+                <p className="text-sm text-gray-600 mb-4">
+                  Visualize how a specific feature influences model predictions. Upload a background dataset and select a feature to see the relationship.
+                </p>
+
+                <div className="flex flex-wrap items-end gap-4">
+                  <div className="min-w-64">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">Select Feature</label>
+                    <div className="relative">
+                      <select
+                        value={selectedFeature}
+                        onChange={(e) => setSelectedFeature(e.target.value)}
+                        className="w-full px-3 py-2 pr-10 border border-gray-300 rounded-lg appearance-none bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        disabled={isLoadingDependence}
+                      >
+                        <option value="">-- Choose a feature --</option>
+                        {explanation.feature_names.map((feature: string) => (
+                          <option key={feature} value={feature}>{feature}</option>
+                        ))}
+                      </select>
+                      <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500 pointer-events-none" />
+                    </div>
+                  </div>
+
+                  <div className="flex-1 min-w-80">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">Background Dataset (CSV)</label>
+                    <label className="cursor-pointer inline-flex items-center px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50">
+                      <Upload className="mr-2 h-4 w-4" />
+                      {dependenceFeatureFile ? dependenceFeatureFile.name : 'Upload CSV'}
+                      <input
+                        type="file"
+                        accept=".csv"
+                        className="hidden"
+                        onChange={handleFeatureFileChange}
+                        disabled={isLoadingDependence}
+                      />
+                    </label>
+                  </div>
+
+                  <button
+                    onClick={loadDependencePlot}
+                    disabled={!selectedFeature || !dependenceFeatureFile || isLoadingDependence}
+                    className="inline-flex items-center px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isLoadingDependence ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Loading...
+                      </>
+                    ) : (
+                      <>
+                        <ScatterChart className="mr-2 h-4 w-4" />
+                        Generate Plot
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {dependenceData && (
+                <div className="mt-6">
+                  <SHAPDependence
+                    featureName={selectedFeature}
+                    xValues={dependenceData.x_values}
+                    shapValues={dependenceData.shap_values}
+                    height={400}
+                  />
+                  <p className="text-xs text-gray-500 mt-2 text-center">
+                    Each point represents a sample from the background dataset.
+                    Red points indicate positive SHAP values (increasing prediction),
+                    blue points indicate negative SHAP values (decreasing prediction).
+                  </p>
+                </div>
+              )}
+            </div>
           )}
 
           {/* Background data info */}

@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Request
 from app.models.model_meta import ModelCreate, ModelResponse, FeatureSchema
 from app.api.v1.auth import get_current_user
 from app.db.mongo import get_db
 from app.utils.file_handler import storage
+from app.utils.audit_logger import log_action, AuditActions
 from datetime import datetime
 from bson import ObjectId
 import json
@@ -50,6 +51,17 @@ async def upload_model(
     
     result = await db.models.insert_one(model_doc)
     model_doc["_id"] = str(result.inserted_id)
+
+    # Log audit event
+    await log_action(
+        user_id=current_user["_id"],
+        action=AuditActions.MODEL_UPLOAD,
+        resource_type="model",
+        resource_id=str(result.inserted_id),
+        details={"name": name, "framework": framework, "task_type": task_type},
+        request=request
+    )
+
     return model_doc
 
 @router.get("/", response_model=List[ModelResponse])
@@ -63,26 +75,58 @@ async def list_models(current_user: dict = Depends(get_current_user)):
     return models
 
 @router.get("/{model_id}", response_model=ModelResponse)
-async def get_model(model_id: str, current_user: dict = Depends(get_current_user)):
+async def get_model(
+    model_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
     db = get_db()
     model = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
     model["_id"] = str(model["_id"])
+
+    # Log audit event (viewing model details)
+    await log_action(
+        user_id=current_user["_id"],
+        action=AuditActions.MODEL_VIEW,
+        resource_type="model",
+        resource_id=model_id,
+        details={"model_name": model.get("name")},
+        request=request
+    )
+
     return model
 
 @router.delete("/{model_id}")
-async def delete_model(model_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_model(
+    model_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
     db = get_db()
     model = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
-    
+
+    model_name = model.get("name")
+
     if model.get("file_path"):
         try:
             storage.delete_file(model["file_path"])
         except Exception as e:
             print(f"Error deleting file from MinIO: {e}")
-            
+
     await db.models.delete_one({"_id": ObjectId(model_id)})
+
+    # Log audit event
+    await log_action(
+        user_id=current_user["_id"],
+        action=AuditActions.MODEL_DELETE,
+        resource_type="model",
+        resource_id=model_id,
+        details={"model_name": model_name},
+        request=request
+    )
+
     return {"status": "success", "message": "Model deleted"}

@@ -1,0 +1,159 @@
+# Default values for xai-platform
+replicaCount: 1
+
+image:
+  repository: yourorg/xai-platform
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Override name for releases
+nameOverride: ""
+fullnameOverride: "xai-platform"
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 80
+
+# Ingress configuration (optional)
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: xai-platform.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# MongoDB
+mongodb:
+  enabled: true
+  image:
+    repository: mongo
+    tag: "7"
+  auth:
+    enabled: true
+    rootPassword: ""
+    username: admin
+    password: ""
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 10Gi
+
+# Redis
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7-alpine"
+  auth:
+    enabled: false
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 1Gi
+
+# MinIO
+minio:
+  enabled: true
+  image:
+    repository: minio/minio
+    tag: latest
+  auth:
+    rootUser: minioadmin
+    rootPassword: minioadmin
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 10Gi
+  bucket:
+    name: xai-models
+
+# Backend API
+backend:
+  replicaCount: 2
+  service:
+    port: 8000
+  env:
+    NODE_ENV: production
+    MONGO_URL: "mongodb://mongodb:27017/xai_platform"
+    REDIS_URL: "redis://redis:6379/0"
+    MINIO_ENDPOINT: minio
+    MINIO_PORT: 9000
+    MINIO_USE_SSL: "false"
+    MINIO_ACCESS_KEY: "minioadmin"
+    MINIO_SECRET_KEY: "minioadmin"
+    MINIO_BUCKET: "xai-models"
+    CELERY_BROKER_URL: "redis://redis:6379/0"
+    CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+    JWT_SECRET_KEY: "change-this-in-production"
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+# Celery Worker
+worker:
+  replicaCount: 2
+  env:
+    NODE_ENV: production
+    MONGO_URL: "mongodb://mongodb:27017/xai_platform"
+    REDIS_URL: "redis://redis:6379/0"
+    MINIO_ENDPOINT: minio
+    MINIO_PORT: 9000
+    MINIO_USE_SSL: "false"
+    MINIO_ACCESS_KEY: "minioadmin"
+    MINIO_SECRET_KEY: "minioadmin"
+    CELERY_BROKER_URL: "redis://redis:6379/0"
+    CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+# Frontend
+frontend:
+  replicaCount: 2
+  service:
+    port: 3000
+  env:
+    NODE_ENV: production
+    NEXT_PUBLIC_API_URL: "http://xai-platform-backend:8000"
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "250m"
+
+# Nginx Ingress Controller (if ingress enabled)
+nginx:
+  enabled: false
+  image:
+    repository: nginx
+    tag: "alpine"
+  service:
+    type: LoadBalancer
+    port: 80
+
+# Persistence
+persistence:
+  storageClass: ""
+
+# Resource limits global
+resources: {}
+
+# Node selector, tolerations, and affinity
+nodeSelector: {}
+tolerations: []
+affinity: {}

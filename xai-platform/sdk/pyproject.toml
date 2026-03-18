@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xai-platform"
+version = "1.0.0"
+description = "Python SDK for XAI Platform API"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "httpx>=0.24.0",
+    "pydantic>=2.0.0",
+    "python-multipart>=0.0.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourorg/xai-platform"
+Documentation = "https://docs.xai-platform.com"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from app.models.model_meta import ModelResponse, FeatureSchema
 from app.api.v1.auth import get_current_user
@@ -6,9 +6,12 @@ from app.db.mongo import get_db
 from app.workers.celery_app import celery_app
 from app.services.model_loader_service import ModelLoaderService
 from app.utils.file_handler import storage
+from app.utils.audit_logger import log_action, AuditActions
+from app.websocket.manager import manager
 from datetime import datetime
 from bson import ObjectId
 import json
+import asyncio
 from typing import Dict, Any, List, Optional
 import pandas as pd
 import io
@@ -21,6 +24,7 @@ router = APIRouter()
 
 @router.post("/local/{model_id}")
 async def request_local_explanation(
+    request: Request,
     model_id: str,
     file: UploadFile = File(None),
     input_data: str = Form(None),
@@ -87,6 +91,15 @@ async def request_local_explanation(
             {"$set": {"explanation_task_id": celery_task_id}}
         )
 
+        # Log audit event
+        await log_action(
+            user_id=current_user["_id"],
+            action=AuditActions.EXPLANATION_CREATE,
+            resource_type="explanation",
+            details={"task_id": celery_task_id, "prediction_id": target_prediction_id, "model_id": model_id, "method": "shap"},
+            request=request
+        )
+
         return {
             "message": "SHAP computation started",
             "task_id": celery_task_id,
@@ -110,18 +123,40 @@ async def get_explanation_result(task_id: str, current_user: dict = Depends(get_
         task = celery_app.AsyncResult(task_id)
         if task.ready():
             result = task.get()
+            explanation_data = None
+            user_id = None
+
             if result.get("explanation_id"):
                 explanation_id = result["explanation_id"]
                 explanation = await db.explanations.find_one({"_id": ObjectId(explanation_id)})
                 if explanation:
+                    # Get model to find user_id
+                    model = await db.models.find_one({"_id": ObjectId(explanation["model_id"])})
+                    if model:
+                        user_id = str(model["user_id"])
+
                     explanation["_id"] = str(explanation["_id"])
                     explanation["prediction_id"] = str(explanation["prediction_id"])
                     explanation["model_id"] = str(explanation["model_id"])
-                    return {
-                        "status": "complete",
-                        "explanation": explanation
-                    }
-            return {"status": "complete", "result": result}
+                    explanation_data = explanation
+
+            response = {
+                "status": "complete",
+                "explanation": explanation_data if explanation_data else result
+            }
+
+            # Send WebSocket notification asynchronously (fire and forget)
+            if user_id:
+                asyncio.create_task(
+                    manager.send_to_user({
+                        "type": "explanation_complete",
+                        "task_id": task_id,
+                        "method": "shap",
+                        "explanation_id": result.get("explanation_id")
+                    }, user_id)
+                )
+
+            return response
         else:
             return {
                 "status": "pending",
@@ -134,6 +169,7 @@ async def get_explanation_result(task_id: str, current_user: dict = Depends(get_
 
 @router.post("/global/{model_id}")
 async def request_global_explanation(
+    request: Request,
     model_id: str,
     background_data: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
@@ -163,6 +199,16 @@ async def request_global_explanation(
         # Trigger async global SHAP computation
         task = celery_app.send_task("compute_global_shap", args=[model_id, bg_object_name])
         task_id = task.id
+
+        # Log audit event
+        await log_action(
+            user_id=current_user["_id"],
+            action=AuditActions.EXPLANATION_CREATE,
+            resource_type="explanation",
+            resource_id=model_id,
+            details={"task_id": task_id, "type": "global", "method": "shap"},
+            request=request
+        )
 
         return {
             "message": "Global SHAP computation started",
@@ -205,6 +251,7 @@ async def get_global_explanation(
 # LIME Endpoints
 @router.post("/lime/{model_id}")
 async def request_lime_explanation(
+    request: Request,
     model_id: str,
     file: UploadFile = File(None),
     input_data: str = Form(None),
@@ -272,6 +319,15 @@ async def request_lime_explanation(
             {"$set": {"lime_task_id": celery_task_id}}
         )
 
+        # Log audit event
+        await log_action(
+            user_id=current_user["_id"],
+            action=AuditActions.EXPLANATION_CREATE,
+            resource_type="explanation",
+            details={"task_id": celery_task_id, "prediction_id": target_prediction_id, "model_id": model_id, "method": "lime", "num_features": num_features},
+            request=request
+        )
+
         return {
             "message": "LIME computation started",
             "task_id": celery_task_id,
@@ -294,18 +350,40 @@ async def get_lime_result(task_id: str, current_user: dict = Depends(get_current
         task = celery_app.AsyncResult(task_id)
         if task.ready():
             result = task.get()
+            explanation_data = None
+            user_id = None
+
             if result.get("explanation_id"):
                 explanation_id = result["explanation_id"]
                 explanation = await db.explanations.find_one({"_id": ObjectId(explanation_id)})
                 if explanation:
+                    # Get model to find user_id
+                    model = await db.models.find_one({"_id": ObjectId(explanation["model_id"])})
+                    if model:
+                        user_id = str(model["user_id"])
+
                     explanation["_id"] = str(explanation["_id"])
                     explanation["prediction_id"] = str(explanation["prediction_id"])
                     explanation["model_id"] = str(explanation["model_id"])
-                    return {
-                        "status": "complete",
-                        "explanation": explanation
-                    }
-            return {"status": "complete", "result": result}
+                    explanation_data = explanation
+
+            response = {
+                "status": "complete",
+                "explanation": explanation_data if explanation_data else result
+            }
+
+            # Send WebSocket notification
+            if user_id:
+                asyncio.create_task(
+                    manager.send_to_user({
+                        "type": "explanation_complete",
+                        "task_id": task_id,
+                        "method": "lime",
+                        "explanation_id": result.get("explanation_id")
+                    }, user_id)
+                )
+
+            return response
         else:
             return {
                 "status": "pending",
@@ -318,6 +396,7 @@ async def get_lime_result(task_id: str, current_user: dict = Depends(get_current
 
 @router.post("/lime/global/{model_id}")
 async def request_global_lime(
+    request: Request,
     model_id: str,
     background_data: UploadFile = File(...),
     num_features: int = Form(10),
@@ -342,6 +421,16 @@ async def request_global_lime(
         # Trigger async global LIME computation
         task = celery_app.send_task("compute_global_lime", args=[model_id, bg_object_name, num_features])
         task_id = task.id
+
+        # Log audit event
+        await log_action(
+            user_id=current_user["_id"],
+            action=AuditActions.EXPLANATION_CREATE,
+            resource_type="explanation",
+            resource_id=model_id,
+            details={"task_id": task_id, "type": "global", "method": "lime", "num_features": num_features},
+            request=request
+        )
 
         return {
             "message": "Global LIME computation started",
@@ -420,6 +509,7 @@ async def get_explanation_by_prediction(
 
 @router.get("/export/{explanation_id}")
 async def export_explanation(
+    request: Request,
     explanation_id: str,
     format: str = "json",  # "json", "csv", "pdf"
     current_user: dict = Depends(get_current_user)
@@ -439,6 +529,16 @@ async def export_explanation(
         model_doc = await db.models.find_one({"_id": ObjectId(explanation["model_id"]), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=403, detail="Access denied")
+
+        # Log audit event before returning
+        await log_action(
+            user_id=current_user["_id"],
+            action=AuditActions.EXPLANATION_EXPORT,
+            resource_type="explanation",
+            resource_id=explanation_id,
+            details={"format": format, "method": explanation.get("method", "unknown")},
+            request=request
+        )
 
         # Format the explanation data
         explanation_data = {

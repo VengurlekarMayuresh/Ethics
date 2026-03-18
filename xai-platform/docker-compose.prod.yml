@@ -1,0 +1,190 @@
+version: '3.8'
+
+services:
+  # PostgreSQL for production (optional, can keep MongoDB)
+  # Currently using MongoDB as primary database
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./backend/.env.production
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URL=mongodb://mongo:27017/xai_platform
+      - MINIO_ENDPOINT=minio
+      - MINIO_PORT=9000
+      - MINIO_USE_SSL=false
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET=xai-models
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - model_uploads:/app/uploads
+    restart: always
+    depends_on:
+      - mongo
+      - redis
+      - minio
+    networks:
+      - xai-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    env_file:
+      - ./backend/.env.production
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URL=mongodb://mongo:27017/xai_platform
+      - MINIO_ENDPOINT=minio
+      - MINIO_PORT=9000
+      - MINIO_USE_SSL=false
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - model_uploads:/app/uploads
+    restart: always
+    depends_on:
+      - redis
+      - mongo
+      - minio
+    networks:
+      - xai-network
+
+  # Frontend Application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+    env_file:
+      - ./frontend/.env.production
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+    restart: always
+    depends_on:
+      - backend
+    networks:
+      - xai-network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro  # SSL certificates
+      - ./nginx/htpasswd:/etc/nginx/htpasswd:ro  # Optional basic auth
+    restart: always
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - xai-network
+
+  # MongoDB
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo_data:/data/db
+      - ./mongo/init.js:/docker-entrypoint-initdb.d/init.js:ro  # Optional initialization
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USER:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:-adminpassword}
+    restart: always
+    networks:
+      - xai-network
+    command: mongod --replSet rs0 --bind_ip_all  # Enable replication for production
+
+  # Redis for Celery and caching
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    restart: always
+    networks:
+      - xai-network
+
+  # MinIO Object Storage (S3 compatible)
+  minio:
+    image: minio/minio:latest
+    volumes:
+      - minio_data:/data
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: minio server /data --console-address ":9001"
+    restart: always
+    networks:
+      - xai-network
+    ports:
+      - "9001:9001"  # MinIO console (remove in production or secure it)
+
+  # Optional: Prometheus for monitoring
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   volumes:
+  #     - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+  #     - prometheus_data:/prometheus
+  #   command:
+  #     - '--config.file=/etc/prometheus/prometheus.yml'
+  #     - '--storage.tsdb.path=/prometheus'
+  #   ports:
+  #     - "9090:9090"
+  #   networks:
+  #     - xai-network
+  #   restart: always
+
+  # Optional: Grafana for dashboards
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #     - ./grafana/provisioning:/etc/grafana/provisioning
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+  #   ports:
+  #     - "3000:3000"
+  #   networks:
+  #     - xai-network
+  #   restart: always
+  #   depends_on:
+  #     - prometheus
+
+volumes:
+  mongo_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  model_uploads:
+    driver: local
+  # prometheus_data:
+  #   driver: local
+  # grafana_data:
+  #   driver: local
+
+networks:
+  xai-network:
+    driver: bridge
