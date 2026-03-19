@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile
 from app.models.model_meta import ModelResponse, FeatureSchema
 from app.api.v1.auth import get_current_user, decode_token, oauth2_scheme
 from app.db.mongo import get_db
@@ -16,7 +16,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     payload = decode_token(token)
     if not payload:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    db = get_db()
+    db = await get_db()
     user = await db.users.find_one({"email": payload.get("sub")})
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
@@ -43,7 +43,7 @@ async def compare_models(
 
         for model_id in model_ids:
             # Get model metadata
-            db = get_db()
+            db = await get_db()
             model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
             if not model_doc:
                 continue  # Skip models not owned by user
@@ -154,7 +154,7 @@ async def get_comparison(
 ):
     """Get comparison result by ID."""
     try:
-        db = get_db()
+        db = await get_db()
         comparison = await db.comparisons.find_one({"_id": ObjectId(comparison_id)})
         if not comparison:
             raise HTTPException(status_code=404, detail="Comparison not found")

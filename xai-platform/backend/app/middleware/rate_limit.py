@@ -1,10 +1,9 @@
 import redis
-import time
-from fastapi import Request, HTTPException, status
+from fastapi import Request, status
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from app.config import settings
 from typing import Callable
-import secrets
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
@@ -25,8 +24,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = 60  # 1 minute window
 
     async def dispatch(self, request: Request, call_next: Callable):
-        # Skip rate limiting for health check
-        if request.url.path == "/health":
+        # Skip rate limiting for health check and CORS preflight.
+        if request.url.path == "/health" or request.method == "OPTIONS":
             return await call_next(request)
 
         # Identify client
@@ -61,20 +60,24 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if identifier:
             # Check rate limit
             key = f"ratelimit:{identifier}"
-            current = self.redis_client.get(key)
-            if current and int(current) >= limit:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Rate limit exceeded",
-                    headers={"Retry-After": str(self.window)}
-                )
-            # Increment count, set expiry if first request
-            pipe = self.redis_client.pipeline()
-            pipe.incr(key)
-            pipe.ttl(key)
-            count, ttl = pipe.execute()
-            if ttl == -1:
-                self.redis_client.expire(key, self.window)
+            try:
+                current = self.redis_client.get(key)
+                if current and int(current) >= limit:
+                    return JSONResponse(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        content={"detail": "Rate limit exceeded"},
+                        headers={"Retry-After": str(self.window)}
+                    )
+                # Increment count, set expiry if first request
+                pipe = self.redis_client.pipeline()
+                pipe.incr(key)
+                pipe.ttl(key)
+                count, ttl = pipe.execute()
+                if ttl == -1:
+                    self.redis_client.expire(key, self.window)
+            except redis.RedisError:
+                # Fail open when Redis is unavailable so API remains reachable.
+                pass
         else:
             # Should not happen but fallback
             pass

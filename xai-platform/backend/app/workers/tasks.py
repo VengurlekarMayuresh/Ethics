@@ -2,7 +2,7 @@ import shap
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional
-from app.celery_app import celery_app
+from app.workers.celery_app import celery_app
 from app.services.model_loader_service import ModelLoaderService
 from app.services.lime_service import LIMEService
 from app.db.mongo import get_db, storage
@@ -50,7 +50,13 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
             # Map framework to SHAP explainer type
             self.update_state(state="PROGRESS", meta={"status": "computing SHAP values", "progress": 50})
 
-            shap_values, expected_value = _compute_shap(model_obj, framework, input_data, model.get("background_data_path"))
+            # Load background data if needed for SHAP (e.g. KernelExplainer)
+            background_data = None
+            if model.get("background_data_path"):
+                bg_bytes = await storage.download_file(model["background_data_path"])
+                background_data = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
+
+            shap_values, expected_value = _compute_shap(model_obj, framework, input_data, background_data)
 
             self.update_state(state="PROGRESS", meta={"status": "finalizing", "progress": 90})
 
@@ -122,7 +128,7 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
                 # If no background data, sample from model's training data if available
                 raise ValueError("Background data is required for global SHAP computation")
 
-            shap_values, expected_value = _compute_shap(model_obj, framework, input_data, None)
+            shap_values, expected_value = _compute_shap(model_obj, framework, input_data, background_data)
 
             self.update_state(state="PROGRESS", meta={"status": "calculating feature importance", "progress": 80})
 
@@ -352,7 +358,7 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
         self.update_state(state="FAILURE", meta={"status": "failed", "error": str(e)})
         raise
 
-def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, background_data_path: Optional[str] = None) -> tuple:
+def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, background_data: Optional[pd.DataFrame] = None) -> tuple:
     """
     Compute SHAP values based on framework and model type.
     Returns (shap_values, expected_value).
@@ -373,11 +379,11 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
 
         else:
             # KernelExplainer for neural nets and other models
-            if background_data_path is None:
+            if background_data is None:
                 raise ValueError("Background data required for KernelExplainer")
 
             # Use first 100 samples as background
-            background_sample = background_data if len(background_data) <= 100 else background_data[:100]
+            background_sample = background_data if len(background_data) <= 100 else background_data.iloc[:100]
 
             explainer = shap.KernelExplainer(model_obj.predict_proba if hasattr(model_obj, 'predict_proba') else model_obj.predict, background_sample)
             shap_values = explainer.shap_values(input_data)

@@ -21,7 +21,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     # First try JWT
     payload = decode_token(token)
     if payload:
-        db = get_db()
+        db = await get_db()
         user = await db.users.find_one({"email": payload.get("sub")})
         if user:
             user["_id"] = str(user["_id"])
@@ -32,7 +32,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     # If not JWT, try API key
     api_key_data = await APIKeyRepository.verify(token)
     if api_key_data:
-        db = get_db()
+        db = await get_db()
         user = await db.users.find_one({"_id": ObjectId(api_key_data["user_id"])})
         if user:
             user["_id"] = str(user["_id"])
@@ -45,7 +45,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 @router.post("/register", response_model=UserResponse)
 async def register(request: Request, user: UserCreate):
-    db = get_db()
+    db = await get_db()
     existing_user = await db.users.find_one({"email": user.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -75,7 +75,7 @@ async def login(
     request: Request,
     form_data: OAuth2PasswordRequestForm = Depends()
 ):
-    db = get_db()
+    db = await get_db()
     user = await db.users.find_one({"email": form_data.username})
     if not user or not verify_password(form_data.password, user["hashed_password"]):
         raise HTTPException(

@@ -18,7 +18,7 @@ async def get_user_from_token(token: str):
     # Try JWT first
     payload = decode_token(token)
     if payload:
-        db = get_db()
+        db = await get_db()
         user = await db.users.find_one({"email": payload.get("sub")})
         if user:
             user["_id"] = str(user["_id"])
@@ -27,7 +27,7 @@ async def get_user_from_token(token: str):
     # Try API key
     api_key_data = await APIKeyRepository.verify(token)
     if api_key_data:
-        db = get_db()
+        db = await get_db()
         user = await db.users.find_one({"_id": ObjectId(api_key_data["user_id"])})
         if user:
             user["_id"] = str(user["_id"])

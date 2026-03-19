@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.models.audit import AuditLogResponse, AuditLogFilter
-from app.api.v1.auth import get_current_user, get_current_user_optional
+from app.api.v1.auth import get_current_user
 from app.db.mongo import get_db
 from app.db.repositories.audit_repository import AuditRepository
-from typing import List
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 router = APIRouter()
@@ -25,7 +25,7 @@ async def get_audit_logs(
     Admins can see all logs; users can only see their own.
     """
     try:
-        db = get_db()
+        db = await get_db()
 
         # For now, allow all logged-in users to see their own logs
         # In production, add role-based access control
@@ -58,7 +58,7 @@ async def get_my_audit_logs(
 ):
     """Get audit logs for the current authenticated user."""
     try:
-        db = get_db()
+        db = await get_db()
         logs = await AuditRepository.get_by_user(db, current_user["_id"], limit, skip)
         return logs
     except Exception as e:
@@ -73,7 +73,7 @@ async def get_audit_logs_by_resource(
 ):
     """Get audit logs for a specific resource."""
     try:
-        db = get_db()
+        db = await get_db()
         logs = await AuditRepository.get_by_resource(db, resource_type, resource_id, limit)
         return logs
     except Exception as e:
@@ -89,9 +89,9 @@ async def get_audit_log_count(
 ):
     """Get count of audit logs matching filters."""
     try:
-        db = get_db()
+        db = await get_db()
 
-        query = {}
+        query: Dict[str, Any] = {}
         if action:
             query["action"] = action
         if user_id and current_user.get("role") == "admin":

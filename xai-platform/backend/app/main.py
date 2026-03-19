@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.db.mongo import connect_db, close_db
 from app.api.v1 import auth, models, predictions, explanations, bias, compare, api_keys, audit, notifications
-from app.middleware.rate_limit import RateLimitMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -17,16 +16,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Add CORS last so it wraps all responses, including middleware errors.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Add rate limiting
-app.add_middleware(RateLimitMiddleware)
 
 @app.get("/health")
 async def health_check():

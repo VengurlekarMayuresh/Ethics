@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request, File, Form, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from app.models.model_meta import ModelResponse, FeatureSchema
 from app.api.v1.auth import get_current_user
@@ -37,7 +37,7 @@ async def request_local_explanation(
     """
     try:
         # Get model metadata
-        db = get_db()
+        db = await get_db()
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -117,7 +117,7 @@ async def get_explanation_result(task_id: str, current_user: dict = Depends(get_
     Returns explanation if complete, or task status.
     """
     try:
-        db = get_db()
+        db = await get_db()
 
         # Check task status in Celery
         task = celery_app.AsyncResult(task_id)
@@ -180,7 +180,7 @@ async def request_global_explanation(
     """
     try:
         # Get model metadata
-        db = get_db()
+        db = await get_db()
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -226,7 +226,7 @@ async def get_global_explanation(
 ):
     """Get the latest global explanation for a model."""
     try:
-        db = get_db()
+        db = await get_db()
 
         # Check model belongs to user
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
@@ -265,7 +265,7 @@ async def request_lime_explanation(
     """
     try:
         # Get model metadata
-        db = get_db()
+        db = await get_db()
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -344,7 +344,7 @@ async def get_lime_result(task_id: str, current_user: dict = Depends(get_current
     Get LIME explanation result by task_id.
     """
     try:
-        db = get_db()
+        db = await get_db()
 
         # Check task status in Celery
         task = celery_app.AsyncResult(task_id)
@@ -408,7 +408,7 @@ async def request_global_lime(
     """
     try:
         # Get model metadata
-        db = get_db()
+        db = await get_db()
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -448,7 +448,7 @@ async def get_global_lime(
 ):
     """Get the latest global LIME explanation for a model."""
     try:
-        db = get_db()
+        db = await get_db()
 
         # Check model belongs to user
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
@@ -480,7 +480,7 @@ async def get_explanation_by_prediction(
     Returns the latest explanation for that prediction.
     """
     try:
-        db = get_db()
+        db = await get_db()
 
         # Verify prediction belongs to user
         prediction = await db.predictions.find_one({
@@ -518,7 +518,7 @@ async def export_explanation(
     Export an explanation in various formats (JSON, CSV, PDF).
     """
     try:
-        db = get_db()
+        db = await get_db()
 
         # Find the explanation
         explanation = await db.explanations.find_one({"_id": ObjectId(explanation_id)})
@@ -692,7 +692,7 @@ async def get_shap_dependence(
     Requires background dataset to compute SHAP values.
     """
     try:
-        db = get_db()
+        db = await get_db()
 
         # Verify model belongs to user
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})

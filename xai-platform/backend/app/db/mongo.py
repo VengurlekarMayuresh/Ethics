@@ -46,13 +46,17 @@ async def connect_db():
     db.client = AsyncIOMotorClient(settings.MONGODB_URL)
 
     # Create collections if they don't exist
-    db.client.get_database().create_collection("users", validator={})
-    db.client.get_database().create_collection("models", validator={})
-    db.client.get_database().create_collection("predictions", validator={})
-    db.client.get_database().create_collection("explanations", validator={})
-    db.client.get_database().create_collection("bias_reports", validator={})
-    db.client.get_database().create_collection("audit_logs", validator={})
-    db.client.get_database().create_collection("api_keys", validator={})
+    database = db.client.get_default_database()
+    existing_collections = await database.list_collection_names()
+    
+    collections = ["users", "models", "predictions", "explanations", "bias_reports", "audit_logs", "api_keys"]
+    for coll in collections:
+        if coll not in existing_collections:
+            await database.create_collection(coll)
+            
+    # Add indexes
+    await database.users.create_index("email", unique=True)
+    await database.api_keys.create_index("key", unique=True)
 
 async def close_db():
     if db.client:

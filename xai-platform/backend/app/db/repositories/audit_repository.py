@@ -1,7 +1,7 @@
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from bson import ObjectId
-from ..models.audit import AuditLogCreate
+from app.models.audit import AuditLogCreate
 
 class AuditRepository:
     @staticmethod

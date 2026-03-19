@@ -1,4 +1,4 @@
-version: "3.9"
+
 
 services:
   backend:
@@ -37,6 +37,7 @@ services:
 
   worker:
     build: ./backend
+    image: xai-platform-worker
     command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
     environment:
       - MONGODB_URL=mongodb://mongo:27017/xai

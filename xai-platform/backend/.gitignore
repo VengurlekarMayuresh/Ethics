@@ -1,0 +1,80 @@
+# 🔹 Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 🔹 Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# 🔹 Environment variables (IMPORTANT)
+.env
+.env.*
+!.env.example
+
+# 🔹 Logs
+*.log
+logs/
+
+# 🔹 Database files
+*.sqlite3
+*.db
+
+# 🔹 Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 🔹 IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 🔹 OS files
+.DS_Store
+Thumbs.db
+
+# 🔹 Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# 🔹 Type checkers
+.mypy_cache/
+.pyre/
+
+# 🔹 Jupyter
+.ipynb_checkpoints/
+
+# 🔹 FastAPI / Uvicorn specific
+*.pid
+
+# 🔹 Docker
+*.tar
+
+# 🔹 Static / media
+staticfiles/
+media/
+uploads/
+
+# 🔹 Secrets / keys
+*.pem
+*.key
+
+# 🔹 AI/ML Specific (Large files)
+*.pkl
+*.joblib
+*.h5
+*.onnx
+*.pb
+*.model
+*.weights
+models/
+data/
+
+# 🔹 Node/Frontend (just in case)
+node_modules/

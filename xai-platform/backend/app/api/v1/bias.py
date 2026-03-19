@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request, File, UploadFile
 from fastapi.responses import StreamingResponse
 from app.models.model_meta import ModelResponse, FeatureSchema
 from app.api.v1.auth import get_current_user, decode_token, oauth2_scheme
@@ -25,7 +25,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     payload = decode_token(token)
     if not payload:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    db = get_db()
+    db = await get_db()
     user = await db.users.find_one({"email": payload.get("sub")})
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
@@ -47,7 +47,7 @@ async def analyze_bias(
     """
     try:
         # Get model metadata
-        db = get_db()
+        db = await get_db()
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -138,7 +138,7 @@ async def get_bias_reports(
     """Get bias reports for a model."""
     try:
         # Verify model belongs to user
-        db = get_db()
+        db = await get_db()
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -176,7 +176,7 @@ async def compare_bias(
 
         for model_id in model_ids:
             # Get model metadata
-            db = get_db()
+            db = await get_db()
             model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
             if not model_doc:
                 continue  # Skip models not owned by user
@@ -227,7 +227,7 @@ async def get_bias_metrics(
     """Get aggregated bias metrics for a model."""
     try:
         # Verify model belongs to user
-        db = get_db()
+        db = await get_db()
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -274,7 +274,7 @@ async def generate_bias_report_pdf(
     Includes fairness metrics and compliance assessment with GDPR, AI Act, and ECOA.
     """
     try:
-        db = get_db()
+        db = await get_db()
 
         # Find the bias report
         report = await db.bias_reports.find_one({"_id": ObjectId(report_id)})

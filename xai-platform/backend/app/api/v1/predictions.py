@@ -27,7 +27,7 @@ async def predict(
     """
     try:
         # Get model metadata
-        db = get_db()
+        db = await get_db()
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -98,7 +98,7 @@ async def batch_predict(
     """
     try:
         # Get model metadata
-        db = get_db()
+        db = await get_db()
         model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -142,7 +142,7 @@ async def get_prediction_history(
 ):
     """Get prediction history for the current user."""
     try:
-        db = get_db()
+        db = await get_db()
         cursor = db.predictions.find(
             {"user_id": current_user["_id"]}
         ).sort("created_at", -1).skip(skip).limit(limit)
@@ -166,7 +166,7 @@ async def get_prediction(
 ):
     """Get a specific prediction by ID."""
     try:
-        db = get_db()
+        db = await get_db()
         prediction = await db.predictions.find_one({
             "_id": ObjectId(prediction_id),
             "user_id": current_user["_id"]

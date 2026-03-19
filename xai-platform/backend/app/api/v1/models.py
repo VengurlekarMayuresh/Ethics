@@ -13,6 +13,7 @@ router = APIRouter()
 
 @router.post("/upload", response_model=ModelResponse)
 async def upload_model(
+    request: Request,
     name: str = Form(...),
     description: str = Form(""),
     framework: str = Form(...),
@@ -32,7 +33,7 @@ async def upload_model(
     storage.upload_file(file_content, object_name)
 
     # Save metadata to DB
-    db = get_db()
+    db = await get_db()
     model_doc = {
         "user_id": current_user["_id"],
         "name": name,
@@ -66,7 +67,7 @@ async def upload_model(
 
 @router.get("/", response_model=List[ModelResponse])
 async def list_models(current_user: dict = Depends(get_current_user)):
-    db = get_db()
+    db = await get_db()
     cursor = db.models.find({"user_id": current_user["_id"]}).sort("created_at", -1)
     models = []
     async for doc in cursor:
@@ -80,7 +81,7 @@ async def get_model(
     request: Request,
     current_user: dict = Depends(get_current_user)
 ):
-    db = get_db()
+    db = await get_db()
     model = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -104,7 +105,7 @@ async def delete_model(
     request: Request,
     current_user: dict = Depends(get_current_user)
 ):
-    db = get_db()
+    db = await get_db()
     model = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
