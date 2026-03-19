@@ -28,7 +28,7 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
             from app.db.mongo import connect_db
             await connect_db()
 
-            db = get_db()
+            db = await get_db()
             # Get prediction record
             prediction = await db.predictions.find_one({"_id": ObjectId(prediction_id)})
             if not prediction:
@@ -101,7 +101,7 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
             from app.db.mongo import connect_db
             await connect_db()
 
-            db = get_db()
+            db = await get_db()
 
             # Get model record
             model = await db.models.find_one({"_id": ObjectId(model_id)})
@@ -182,7 +182,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             from app.db.mongo import connect_db
             await connect_db()
 
-            db = get_db()
+            db = await get_db()
 
             # Get prediction record
             prediction = await db.predictions.find_one({"_id": ObjectId(prediction_id)})
@@ -282,7 +282,7 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
             from app.db.mongo import connect_db
             await connect_db()
 
-            db = get_db()
+            db = await get_db()
 
             # Get model record
             model = await db.models.find_one({"_id": ObjectId(model_id)})

@@ -86,9 +86,7 @@ export default function ModelUpload() {
       formData.append('feature_schema', JSON.stringify(formattedFeatures));
       formData.append('file', file);
 
-      await api.post('/models/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
-      });
+      await api.post('/models/upload', formData);
 
       router.push('/models');
     } catch (err: any) {

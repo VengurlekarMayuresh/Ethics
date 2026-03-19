@@ -29,7 +29,7 @@ async def log_action(
         request: Optional FastAPI Request object to extract IP/user-agent
     """
     try:
-        db = get_db()
+        db = await get_db()
         ip_address = None
         user_agent = None
 

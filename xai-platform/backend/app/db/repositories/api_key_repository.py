@@ -30,7 +30,7 @@ class APIKeyRepository:
             "last_used_at": None
         }
 
-        db = get_db()
+        db = await get_db()
         result = await db.api_keys.insert_one(api_key_doc)
         api_key_id = str(result.inserted_id)
 
@@ -47,7 +47,7 @@ class APIKeyRepository:
     @staticmethod
     async def get_by_id(api_key_id: str) -> Optional[Dict[str, Any]]:
         """Get API key by ID (without sensitive fields)."""
-        db = get_db()
+        db = await get_db()
         doc = await db.api_keys.find_one({"_id": ObjectId(api_key_id)})
         if doc:
             return APIKeyRepository._sanitize(doc)
@@ -56,7 +56,7 @@ class APIKeyRepository:
     @staticmethod
     async def get_by_user(user_id: str) -> List[Dict[str, Any]]:
         """List API keys for a user."""
-        db = get_db()
+        db = await get_db()
         cursor = db.api_keys.find({"user_id": user_id}).sort("created_at", -1)
         keys = []
         async for doc in cursor:
@@ -78,7 +78,7 @@ class APIKeyRepository:
         if len(raw_key) < 8:
             return None
         key_prefix = raw_key[:8]
-        db = get_db()
+        db = await get_db()
         # Find keys with matching prefix
         cursor = db.api_keys.find({"key_prefix": key_prefix})
         async for doc in cursor:
@@ -97,7 +97,7 @@ class APIKeyRepository:
     @staticmethod
     async def delete(api_key_id: str, user_id: str) -> bool:
         """Revoke an API key."""
-        db = get_db()
+        db = await get_db()
         result = await db.api_keys.delete_one({
             "_id": ObjectId(api_key_id),
             "user_id": user_id

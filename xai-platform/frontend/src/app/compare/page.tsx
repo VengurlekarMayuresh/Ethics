@@ -66,7 +66,6 @@ export default function ComparePage() {
       // Since it's FormData, I can't include list in form. Need to send as query string. Let's adjust: call with params: { model_ids: selectedModelIds } and body: formData.
       const { data } = await api.post('/compare/', formData, {
         params: { model_ids: selectedModelIds },
-        headers: { 'Content-Type': 'multipart/form-data' },
       });
       return data;
     },

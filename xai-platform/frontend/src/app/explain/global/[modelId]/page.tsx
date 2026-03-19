@@ -98,9 +98,7 @@ export default function GlobalExplanationPage() {
       const endpoint = requestMethod === 'shap'
         ? `/explain/global/${modelId}`
         : `/explain/lime/global/${modelId}`;
-      const { data } = await api.post(endpoint, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
+      const { data } = await api.post(endpoint, formData);
       return data;
     },
     onSuccess: () => {
@@ -135,9 +133,7 @@ export default function GlobalExplanationPage() {
       const formData = new FormData();
       formData.append('background_data', dependenceFeatureFile);
 
-      const { data } = await api.post(`/explain/dependence/${modelId}?feature=${encodeURIComponent(selectedFeature)}`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
+      const { data } = await api.post(`/explain/dependence/${modelId}?feature=${encodeURIComponent(selectedFeature)}`, formData);
       setDependenceData({
         x_values: data.x_values,
         shap_values: data.shap_values,
@@ -276,7 +272,7 @@ export default function GlobalExplanationPage() {
           <div>
             <h4 className="text-sm font-medium text-red-800">Failed to load explanation</h4>
             <p className="mt-1 text-sm text-red-700">
-              {explanationError.response?.data?.detail || 'An error occurred while fetching the explanation.'}
+              {(explanationError as any).response?.data?.detail || 'An error occurred while fetching the explanation.'}
             </p>
             {requestMethod === 'shap' ? (
               <button
