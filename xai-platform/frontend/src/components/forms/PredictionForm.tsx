@@ -5,6 +5,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { Loader2, Play } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 
 interface FeatureSchema {
   name: string;
@@ -31,9 +32,9 @@ export default function PredictionForm({
 
   const predictMutation = useMutation({
     mutationFn: async (data: Record<string, any>) => {
-      const response = await api.post(`/predict/${modelId}`, null, {
-        params: data, // Send as query params for simple predictions
-      });
+      const formData = new FormData();
+      formData.append('input_data', JSON.stringify(data));
+      const response = await api.post(`/predict/${modelId}`, formData);
       return response.data;
     },
     onSuccess: (data) => {

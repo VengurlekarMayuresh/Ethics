@@ -2,7 +2,7 @@ import boto3
 from botocore.exceptions import ClientError
 from motor.motor_asyncio import AsyncIOMotorClient
 from app.config import settings
-import io
+import io, asyncio
 from typing import Any, Dict, List
 
 class MinIOClient:
@@ -23,16 +23,21 @@ class MinIOClient:
         except ClientError:
             self.s3_client.create_bucket(Bucket=self.bucket)
 
-    def upload_file(self, file_content: bytes, object_name: str) -> str:
-        self.s3_client.upload_fileobj(io.BytesIO(file_content), self.bucket, object_name)
+    async def upload_file(self, file_content: bytes, object_name: str) -> str:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.s3_client.upload_fileobj, io.BytesIO(file_content), self.bucket, object_name)
         return object_name
 
-    def download_file(self, object_name: str) -> bytes:
-        response = self.s3_client.get_object(Bucket=self.bucket, Key=object_name)
-        return response['Body'].read()
+    async def download_file(self, object_name: str) -> bytes:
+        loop = asyncio.get_event_loop()
+        def _download():
+            response = self.s3_client.get_object(Bucket=self.bucket, Key=object_name)
+            return response['Body'].read()
+        return await loop.run_in_executor(None, _download)
 
-    def delete_file(self, object_name: str):
-        self.s3_client.delete_object(Bucket=self.bucket, Key=object_name)
+    async def delete_file(self, object_name: str):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.s3_client.delete_object, Bucket=self.bucket, Key=object_name)
 
 storage = MinIOClient()
 

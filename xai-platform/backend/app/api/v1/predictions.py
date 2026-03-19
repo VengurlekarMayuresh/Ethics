@@ -45,7 +45,12 @@ async def predict(
             # Handle direct JSON input
             input_dict = json.loads(input_data)
         else:
-            raise HTTPException(status_code=400, detail="Either file or input_data must be provided")
+            # Fallback for query parameters (backward compatibility/simple testing)
+            query_params = dict(request.query_params)
+            if query_params:
+                input_dict = query_params
+            else:
+                raise HTTPException(status_code=400, detail="Either file, input_data or query parameters must be provided")
 
         # Validate input against feature schema
         feature_schema = [FeatureSchema(**schema) for schema in model_doc["feature_schema"]]
@@ -83,7 +88,10 @@ async def predict(
 
         return formatted_result
 
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Error in prediction API: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/{model_id}/batch", response_model=List[Dict[str, Any]])
@@ -131,7 +139,10 @@ async def batch_predict(
 
         return results
 
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Error in prediction API: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/history", response_model=List[Dict[str, Any]])
@@ -156,7 +167,10 @@ async def get_prediction_history(
 
         return predictions
 
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Error in prediction API: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{prediction_id}", response_model=Dict[str, Any])

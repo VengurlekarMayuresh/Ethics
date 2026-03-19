@@ -188,7 +188,7 @@ async def request_global_explanation(
         # Upload background data to storage
         contents = await background_data.read()
         bg_object_name = f"{current_user['_id']}/bg_{int(datetime.utcnow().timestamp())}_{background_data.filename}"
-        storage.upload_file(contents, bg_object_name)
+        await storage.upload_file(contents, bg_object_name)
 
         # Store background data reference in model
         await db.models.update_one(
@@ -490,9 +490,14 @@ async def get_explanation_by_prediction(
         if not prediction:
             raise HTTPException(status_code=404, detail="Prediction not found")
 
-        # Find explanation for this prediction (any method, local)
+        # Find explanation for this prediction (any method, local).
+        # Support both legacy string IDs and ObjectId storage formats.
+        prediction_id_filters = [{"prediction_id": prediction_id}]
+        if ObjectId.is_valid(prediction_id):
+            prediction_id_filters.append({"prediction_id": ObjectId(prediction_id)})
+
         explanation = await db.explanations.find_one(
-            {"prediction_id": prediction_id, "explanation_type": "local"},
+            {"$and": [{"$or": prediction_id_filters}, {"explanation_type": "local"}]},
             sort=[("created_at", -1)]
         )
 
@@ -502,8 +507,22 @@ async def get_explanation_by_prediction(
             explanation["prediction_id"] = str(explanation["prediction_id"])
             return explanation
         else:
+            # If explanation was requested but not finished yet, expose task status.
+            task_id = prediction.get("explanation_task_id") or prediction.get("lime_task_id")
+            if task_id:
+                task = celery_app.AsyncResult(task_id)
+                if not task.ready():
+                    return {
+                        "status": "pending",
+                        "task_id": task_id,
+                        "task_state": task.state,
+                        "info": task.info if task.info else None
+                    }
+
             raise HTTPException(status_code=404, detail="No explanation found for this prediction. Request one first.")
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

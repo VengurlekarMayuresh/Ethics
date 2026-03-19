@@ -19,15 +19,20 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
       - api_key_scopes: List[str] if authenticated via API key
     """
     # First try JWT
-    payload = decode_token(token)
-    if payload:
-        db = await get_db()
-        user = await db.users.find_one({"email": payload.get("sub")})
-        if user:
-            user["_id"] = str(user["_id"])
-            user["auth_method"] = "jwt"
-            return user
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    try:
+        payload = decode_token(token)
+        if payload:
+            db = await get_db()
+            user = await db.users.find_one({"email": payload.get("sub")})
+            if user:
+                user["_id"] = str(user["_id"])
+                user["auth_method"] = "jwt"
+                return user
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    except Exception as e:
+        if "expired" in str(e).lower():
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+        # For other JWT errors, continue to check API key
 
     # If not JWT, try API key
     api_key_data = await APIKeyRepository.verify(token)
@@ -41,6 +46,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             return user
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
+    print(f"Auth failed for token: {token[:10]}...")
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
 
 @router.post("/register", response_model=UserResponse)

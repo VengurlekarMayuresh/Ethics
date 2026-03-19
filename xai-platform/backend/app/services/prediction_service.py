@@ -1,5 +1,5 @@
 import joblib
-import pickle
+import io
 import json
 import numpy as np
 import pandas as pd
@@ -36,7 +36,7 @@ class ModelLoader:
             framework = cls.detect_framework(model_path)
 
             if framework == "sklearn":
-                return joblib.loads(model_file), framework
+                return joblib.load(io.BytesIO(model_file)), framework
             elif framework == "xgboost":
                 import xgboost as xgb
                 model = xgb.Booster()

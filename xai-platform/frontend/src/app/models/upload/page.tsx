@@ -91,7 +91,11 @@ export default function ModelUpload() {
       router.push('/models');
     } catch (err: any) {
       console.error(err);
-      setError(err.response?.data?.detail || 'Failed to upload model. Please check the API server.');
+      const detail = err.response?.data?.detail;
+      const errorMessage = typeof detail === 'string' 
+        ? detail 
+        : (Array.isArray(detail) ? JSON.stringify(detail) : 'Failed to upload model. Please check the API server.');
+      setError(errorMessage);
     } finally {
       setIsSubmitting(false);
     }

@@ -30,7 +30,7 @@ async def upload_model(
     # Read and upload file to MinIO
     file_content = await file.read()
     object_name = f"{current_user['_id']}/{int(datetime.utcnow().timestamp())}_{file.filename}"
-    storage.upload_file(file_content, object_name)
+    await storage.upload_file(file_content, object_name)
 
     # Save metadata to DB
     db = await get_db()
@@ -114,7 +114,7 @@ async def delete_model(
 
     if model.get("file_path"):
         try:
-            storage.delete_file(model["file_path"])
+            await storage.delete_file(model["file_path"])
         except Exception as e:
             print(f"Error deleting file from MinIO: {e}")
 

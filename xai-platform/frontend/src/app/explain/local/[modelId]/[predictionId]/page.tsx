@@ -18,9 +18,10 @@ import LIMEPlot from '@/components/charts/LIMEPlot';
 import { format } from 'date-fns';
 
 interface Explanation {
-  _id: string;
+  _id?: string;
+  status?: string;
   method: 'shap' | 'lime';
-  explanation_type: 'local' | 'global';
+  explanation_type?: 'local' | 'global';
   shap_values?: number[][];
   lime_weights?: any[];
   expected_value?: number;
@@ -28,7 +29,7 @@ interface Explanation {
   lime_local_pred?: number;
   feature_names?: string[];
   nl_explanation?: string;
-  created_at: string;
+  created_at?: string;
 }
 
 interface Prediction {
@@ -120,7 +121,8 @@ export default function LocalExplanationPage() {
   } : null;
 
   // Determine what to show
-  const isLoading = predictionLoading || explanationLoading || requestExplanation.isPending;
+  const isPending = explanation?.status === 'pending' || requestExplanation.isPending;
+  const isLoading = predictionLoading || explanationLoading || isPending;
 
   if (predictionLoading) {
     return (
@@ -227,7 +229,7 @@ export default function LocalExplanationPage() {
               )}
             </div>
             <p className="text-xs text-gray-500 mt-2">
-              Generated: {format(new Date(prediction.created_at), 'MMM d, yyyy HH:mm')}
+              Generated: {prediction.created_at ? format(new Date(prediction.created_at), 'MMM d, yyyy HH:mm') : 'N/A'}
             </p>
           </div>
         </div>
@@ -236,7 +238,7 @@ export default function LocalExplanationPage() {
       {/* Explanation content */}
       {(isLoading || explanationError) && (
         <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-8 text-center">
-          {requestExplanation.isPending ? (
+          {isPending ? (
             <>
               <Loader2 className="mx-auto h-10 w-10 animate-spin text-yellow-500" />
               <h3 className="mt-4 text-lg font-semibold text-yellow-800">
@@ -266,7 +268,7 @@ export default function LocalExplanationPage() {
         </div>
       )}
 
-      {explanation && (
+      {explanation && explanation.status !== 'pending' && (
         <div className="space-y-6">
           {/* Natural language explanation */}
           {explanation.nl_explanation && (
@@ -312,10 +314,10 @@ export default function LocalExplanationPage() {
               </div>
               <div>
                 <span className="font-medium">Generated:</span>{' '}
-                {format(new Date(explanation.created_at), 'MMM d, yyyy HH:mm')}
+                {explanation.created_at ? format(new Date(explanation.created_at), 'MMM d, yyyy HH:mm') : 'N/A'}
               </div>
               <div className="text-xs text-gray-500">
-                ID: {explanation._id.slice(0, 8)}...
+                ID: {explanation._id?.slice(0, 8) || 'N/A'}...
               </div>
             </div>
           </div>
