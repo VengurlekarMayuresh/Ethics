@@ -57,7 +57,6 @@ class LIMEService:
             mode=mode,
             class_names=None,
             kernel_width=3,
-            num_features=min(10, len(feature_names)),
             discretize_continuous=True,
             discretizer='quartile',
             verbose=False
@@ -86,26 +85,33 @@ class LIMEService:
         Returns:
             Dictionary with explanation data
         """
-        # Define prediction function
+        # Define robust prediction function
         def predict_fn(data):
-            # Convert to DataFrame for models that expect it
-            if hasattr(model, 'predict_proba'):
-                try:
-                    preds = model.predict_proba(data)
-                except:
-                    preds = model.predict(data)
-            else:
-                preds = model.predict(data)
-
-            # Handle different output formats
-            if isinstance(preds, list):
-                # Multi-output or multi-class
-                return np.column_stack(preds)
-            elif preds.ndim == 1:
-                # Regression or binary classification with 1D output
-                return preds.reshape(-1, 1) if len(preds.shape) == 1 else preds
-            else:
-                return preds
+            # Convert DataFrame to numpy if needed
+            if isinstance(data, pd.DataFrame):
+                data = data.values
+            try:
+                # For models with predict_proba (e.g., sklearn classifiers)
+                if hasattr(model, 'predict_proba'):
+                    return model.predict_proba(data)
+                # For models with predict method (sklearn, xgboost, etc.)
+                elif hasattr(model, 'predict'):
+                    return model.predict(data)
+                # For ONNX Runtime inference sessions
+                elif hasattr(model, 'run') and callable(model.run):
+                    input_name = model.get_inputs()[0].name
+                    data_ = data.astype(np.float32)
+                    if data_.ndim == 1:
+                        data_ = data_.reshape(1, -1)
+                    outputs = model.run(None, {input_name: data_})
+                    return outputs[0]
+                # For callable model objects
+                elif callable(model):
+                    return model(data)
+                else:
+                    raise TypeError("Model does not have a compatible prediction interface")
+            except Exception as e:
+                raise RuntimeError(f"Prediction failed: {e}")
 
         # Generate explanation
         exp = explainer.explain_instance(

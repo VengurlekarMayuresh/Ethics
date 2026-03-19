@@ -55,8 +55,35 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
             if model.get("background_data_path"):
                 bg_bytes = await storage.download_file(model["background_data_path"])
                 background_data = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
+            else:
+                # Fallback: build background from recent predictions for the same model
+                # to avoid degenerate all-zero SHAP values with single-row background.
+                recent_inputs = []
+                model_id_filters = [{"model_id": model_id}]
+                if ObjectId.is_valid(model_id):
+                    model_id_filters.append({"model_id": ObjectId(model_id)})
+
+                cursor = db.predictions.find(
+                    {"$or": model_id_filters},
+                    {"input_data": 1, "_id": 0}
+                ).sort("created_at", -1).limit(200)
+
+                async for row in cursor:
+                    inp = row.get("input_data")
+                    if isinstance(inp, dict):
+                        recent_inputs.append(inp)
+
+                if len(recent_inputs) >= 2:
+                    background_data = pd.DataFrame(recent_inputs)
+                    # Keep column order aligned with current input.
+                    background_data = background_data.reindex(columns=input_data.columns, fill_value=np.nan)
 
             shap_values, expected_value = _compute_shap(model_obj, framework, input_data, background_data)
+
+            # Normalize SHAP values for frontend (ensure 2D array with one row)
+            shap_values_norm, expected_value_norm = _normalize_shap_local(
+                shap_values, expected_value, prediction.get("prediction"), input_data
+            )
 
             self.update_state(state="PROGRESS", meta={"status": "finalizing", "progress": 90})
 
@@ -66,8 +93,8 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
                 "model_id": model_id,
                 "method": "shap",
                 "explanation_type": "local",
-                "shap_values": shap_values.tolist() if isinstance(shap_values, np.ndarray) else shap_values,
-                "expected_value": expected_value if isinstance(expected_value, float) else expected_value.tolist(),
+                "shap_values": shap_values_norm,
+                "expected_value": expected_value_norm,
                 "feature_names": list(input_data.columns) if hasattr(input_data, 'columns') else [],
                 "nl_explanation": None,  # TODO: Add NLG service
                 "task_id": self.request.id,
@@ -84,8 +111,7 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
 
         return asyncio.run(async_task())
 
-    except Exception as e:
-        self.update_state(state="FAILURE", meta={"status": "failed", "error": str(e)})
+    except Exception:
         raise
 
 @celery_app.task(bind=True, name="compute_global_shap")
@@ -165,8 +191,7 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
 
         return asyncio.run(async_task())
 
-    except Exception as e:
-        self.update_state(state="FAILURE", meta={"status": "failed", "error": str(e)})
+    except Exception:
         raise
 
 @celery_app.task(bind=True, name="compute_lime_values")
@@ -265,8 +290,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
 
         return asyncio.run(async_task())
 
-    except Exception as e:
-        self.update_state(state="FAILURE", meta={"status": "failed", "error": str(e)})
+    except Exception:
         raise
 
 @celery_app.task(bind=True, name="compute_global_lime")
@@ -354,42 +378,157 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
 
         return asyncio.run(async_task())
 
-    except Exception as e:
-        self.update_state(state="FAILURE", meta={"status": "failed", "error": str(e)})
+    except Exception:
         raise
 
 def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, background_data: Optional[pd.DataFrame] = None) -> tuple:
     """
-    Compute SHAP values based on framework and model type.
+    Compute SHAP values. Handles pipelines, tree models, linear models, etc.
     Returns (shap_values, expected_value).
     """
     import shap
     import numpy as np
+    from sklearn.pipeline import Pipeline
 
     try:
-        if framework in ["sklearn", "xgboost", "lightgbm"]:
-            explainer = shap.TreeExplainer(model_obj)
-            shap_values = explainer.shap_values(input_data)
-            expected_value = explainer.expected_value
+        # Check if model is a sklearn Pipeline
+        if isinstance(model_obj, Pipeline):
+            # For pipelines, use KernelExplainer with the full pipeline
+            # This respects all preprocessing steps
+            if background_data is not None and len(background_data) > 0:
+                bg = background_data if len(background_data) <= 100 else background_data.iloc[:100]
+            else:
+                bg = input_data
 
-        elif framework == "linear":
-            explainer = shap.LinearExplainer(model_obj, input_data)
-            shap_values = explainer.shap_values(input_data)
+            # Use the pipeline's predict method
+            predict_fn = model_obj.predict
+
+            def _predict_with_columns(values):
+                if isinstance(values, np.ndarray):
+                    df = pd.DataFrame(values, columns=input_data.columns)
+                else:
+                    df = values
+                preds = predict_fn(df)
+                # Ensure return is numpy array
+                if isinstance(preds, np.ndarray):
+                    return preds
+                elif hasattr(preds, 'toarray'):
+                    return preds.toarray()
+                else:
+                    return np.array(preds)
+
+            explainer = shap.KernelExplainer(_predict_with_columns, bg.values)
+            shap_values = explainer.shap_values(input_data.values)
             expected_value = explainer.expected_value
 
         else:
-            # KernelExplainer for neural nets and other models
-            if background_data is None:
-                raise ValueError("Background data required for KernelExplainer")
+            # For non-pipeline models, try TreeExplainer first for tree-based models
+            try:
+                explainer = shap.TreeExplainer(model_obj)
+                shap_values = explainer.shap_values(input_data)
+                expected_value = explainer.expected_value
+            except Exception:
+                # Fallback to KernelExplainer
+                if background_data is not None and len(background_data) > 0:
+                    bg = background_data if len(background_data) <= 100 else background_data.iloc[:100]
+                else:
+                    # Generate synthetic background if none provided
+                    bg = input_data
 
-            # Use first 100 samples as background
-            background_sample = background_data if len(background_data) <= 100 else background_data.iloc[:100]
+                predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
 
-            explainer = shap.KernelExplainer(model_obj.predict_proba if hasattr(model_obj, 'predict_proba') else model_obj.predict, background_sample)
-            shap_values = explainer.shap_values(input_data)
-            expected_value = explainer.expected_value
+                def _predict_with_columns(values):
+                    if isinstance(values, np.ndarray):
+                        df = pd.DataFrame(values, columns=input_data.columns)
+                    else:
+                        df = values
+                    return predict_fn(df)
+
+                explainer = shap.KernelExplainer(_predict_with_columns, bg.values)
+                shap_values = explainer.shap_values(input_data.values)
+                expected_value = explainer.expected_value
 
         return shap_values, expected_value
 
     except Exception as e:
         raise ValueError(f"SHAP computation failed: {str(e)}")
+
+
+def _normalize_shap_local(
+    shap_values: Any,
+    expected_value: Any,
+    prediction_value: Any,
+    input_data: pd.DataFrame,
+) -> tuple[list[list[float]], float]:
+    """
+    Normalize SHAP output for local explanations.
+
+    Returns:
+    - shap values as a single-row 2D list: [[f1, f2, ...]]
+    - expected value as a scalar float
+    """
+    feature_count = len(input_data.columns) if hasattr(input_data, "columns") else int(np.asarray(input_data).shape[-1])
+
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _get_class_index(n_classes: int) -> int:
+        # For binary classification, index 1 is typically the positive class.
+        if n_classes == 2:
+            return 1
+        try:
+            idx = int(np.asarray(prediction_value).item())
+            if 0 <= idx < n_classes:
+                return idx
+        except Exception:
+            pass
+        return 0
+
+    def _fit_feature_size(vec: np.ndarray) -> np.ndarray:
+        vec = np.asarray(vec, dtype=float).reshape(-1)
+        if vec.size < feature_count:
+            vec = np.pad(vec, (0, feature_count - vec.size), mode="constant")
+        elif vec.size > feature_count:
+            vec = vec[:feature_count]
+        return vec
+
+    # Normalize SHAP values to one feature vector for the current instance.
+    if isinstance(shap_values, list):
+        if len(shap_values) == 0:
+            local_vec = np.zeros(feature_count, dtype=float)
+        else:
+            class_idx = _get_class_index(len(shap_values))
+            arr = np.asarray(shap_values[class_idx], dtype=float)
+            local_vec = arr[0] if arr.ndim > 1 else arr
+    else:
+        arr = np.asarray(shap_values, dtype=float)
+        if arr.ndim == 1:
+            local_vec = arr
+        elif arr.ndim == 2:
+            local_vec = arr[0]
+        elif arr.ndim >= 3:
+            # Common shape for multiclass can be (classes, samples, features).
+            class_idx = _get_class_index(arr.shape[0])
+            class_arr = np.asarray(arr[class_idx], dtype=float)
+            local_vec = class_arr[0] if class_arr.ndim > 1 else class_arr
+        else:
+            local_vec = np.zeros(feature_count, dtype=float)
+
+    local_vec = _fit_feature_size(local_vec)
+
+    # Normalize expected value to scalar.
+    if isinstance(expected_value, (list, tuple, np.ndarray)):
+        ev_arr = np.asarray(expected_value, dtype=float).reshape(-1)
+        if ev_arr.size == 0:
+            expected_scalar = 0.0
+        elif ev_arr.size == 1:
+            expected_scalar = _safe_float(ev_arr[0])
+        else:
+            expected_scalar = _safe_float(ev_arr[_get_class_index(ev_arr.size)], _safe_float(ev_arr[0]))
+    else:
+        expected_scalar = _safe_float(expected_value)
+
+    return [local_vec.tolist()], expected_scalar

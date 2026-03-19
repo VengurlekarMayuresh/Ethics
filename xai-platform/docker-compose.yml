@@ -38,7 +38,7 @@ services:
   worker:
     build: ./backend
     image: xai-platform-worker
-    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+    command: celery -A app.workers.celery_app worker --loglevel=info --pool=solo
     environment:
       - MONGODB_URL=mongodb://mongo:27017/xai
       - REDIS_URL=redis://redis:6379

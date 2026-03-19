@@ -30,6 +30,7 @@ interface Explanation {
   feature_names?: string[];
   nl_explanation?: string;
   created_at?: string;
+  error?: string;
 }
 
 interface Prediction {
@@ -77,6 +78,10 @@ export default function LocalExplanationPage() {
     },
     enabled: !!predictionId,
     retry: false, // Don't retry on 404 (no explanation yet)
+    refetchInterval: (query) => {
+      // Poll every 3 seconds if status is pending
+      return query.state.data?.status === 'pending' ? 3000 : false;
+    },
   });
 
   // Request explanation mutation
@@ -108,7 +113,7 @@ export default function LocalExplanationPage() {
   const shapData = hasShap ? {
     shapValues: explanation.shap_values?.[0] || [], // For single prediction, first row
     baseValue: explanation.expected_value || 0,
-    prediction: prediction?.prediction || 0,
+    prediction: typeof prediction?.prediction === 'number' ? prediction.prediction : 0,
     featureNames: explanation.feature_names || [],
   } : null;
 
@@ -122,6 +127,7 @@ export default function LocalExplanationPage() {
 
   // Determine what to show
   const isPending = explanation?.status === 'pending' || requestExplanation.isPending;
+  const isFailed = explanation?.status === 'failed';
   const isLoading = predictionLoading || explanationLoading || isPending;
 
   if (predictionLoading) {
@@ -236,7 +242,7 @@ export default function LocalExplanationPage() {
       </div>
 
       {/* Explanation content */}
-      {(isLoading || explanationError) && (
+      {(isLoading || explanationError || isFailed) && (
         <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-8 text-center">
           {isPending ? (
             <>
@@ -248,12 +254,12 @@ export default function LocalExplanationPage() {
                 This may take a few moments depending on model complexity.
               </p>
             </>
-          ) : explanationError ? (
+          ) : (explanationError || isFailed) ? (
             <>
               <AlertCircle className="mx-auto h-10 w-10 text-red-400" />
               <h3 className="mt-4 text-lg font-semibold text-red-800">Explanation error</h3>
               <p className="mt-2 text-red-700">
-                {explanationError.response?.data?.detail || 'Failed to compute explanation.'}
+                {explanation?.error || explanationError?.response?.data?.detail || 'Failed to compute explanation.'}
               </p>
             </>
           ) : !explanation ? (

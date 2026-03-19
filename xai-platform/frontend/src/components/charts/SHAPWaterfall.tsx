@@ -33,30 +33,45 @@ const SHAPWaterfall: React.FC<SHAPWaterfallProps> = ({
   title = 'SHAP Waterfall Plot',
   height = 500,
 }) => {
+  const toFiniteNumber = (value: unknown, fallback = 0) => {
+    const n = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  };
+
+  const formatNumber = (value: unknown, digits = 4) => {
+    const n = toFiniteNumber(value, 0);
+    return n.toFixed(digits);
+  };
+
+  const safeBaseValue = toFiniteNumber(baseValue, 0);
+  const safePrediction = toFiniteNumber(prediction, 0);
+  const impact = safePrediction - safeBaseValue;
+
   // Transform SHAP values into chart data: positive and negative contributions
   const chartData = useMemo(() => {
     return shapValues.map((shap) => ({
       feature: shap.feature,
-      value: shap.value,
+      value: toFiniteNumber(shap.value, 0),
       // Split into positive and negative for stacked effect
-      positive: shap.value > 0 ? shap.value : 0,
-      negative: shap.value < 0 ? shap.value : 0,
+      positive: toFiniteNumber(shap.value, 0) > 0 ? toFiniteNumber(shap.value, 0) : 0,
+      negative: toFiniteNumber(shap.value, 0) < 0 ? toFiniteNumber(shap.value, 0) : 0,
     }));
   }, [shapValues]);
 
   const CustomTooltip = ({ active, payload, label }: any) => {
     if (active && payload && payload.length) {
       const shap = shapValues.find(s => s.feature === label);
+      const shapValue = toFiniteNumber(shap?.value, 0);
       return (
         <div className="bg-white p-3 border border-gray-200 rounded-lg shadow-lg">
           <p className="text-sm font-semibold text-gray-900">{label}</p>
           <p className="text-sm">
             SHAP value:{' '}
-            <span className={shap.value >= 0 ? 'text-green-600' : 'text-red-600'}>
-              {shap.value >= 0 ? '+' : ''}{shap.value.toFixed(4)}
+            <span className={shapValue >= 0 ? 'text-green-600' : 'text-red-600'}>
+              {shapValue >= 0 ? '+' : ''}{formatNumber(shapValue, 4)}
             </span>
           </p>
-          {shap.value_formatted && (
+          {shap?.value_formatted && (
             <p className="text-xs text-gray-500">{shap.value_formatted}</p>
           )}
         </div>
@@ -72,16 +87,16 @@ const SHAPWaterfall: React.FC<SHAPWaterfallProps> = ({
       <div className="flex items-center gap-4 text-sm text-gray-600 mb-4">
         <div>
           <span className="font-medium">Base value:</span>{' '}
-          <span className="font-mono">{baseValue.toFixed(4)}</span>
+          <span className="font-mono">{formatNumber(safeBaseValue, 4)}</span>
         </div>
         <div>
           <span className="font-medium">Prediction:</span>{' '}
-          <span className="font-mono">{prediction.toFixed(4)}</span>
+          <span className="font-mono">{formatNumber(safePrediction, 4)}</span>
         </div>
         <div>
           <span className="font-medium">Impact:</span>{' '}
-          <span className={`font-mono ${prediction - baseValue >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-            {(prediction - baseValue).toFixed(4)}
+          <span className={`font-mono ${impact >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+            {formatNumber(impact, 4)}
           </span>
         </div>
       </div>
@@ -101,7 +116,7 @@ const SHAPWaterfall: React.FC<SHAPWaterfallProps> = ({
 
           {/* Base value reference line */}
           <ReferenceLine
-            x={baseValue}
+            x={safeBaseValue}
             stroke="#6b7280"
             strokeDasharray="3 3"
             label={{ value: 'Base', position: 'top', fill: '#6b7280', fontSize: 11 }}
@@ -109,7 +124,7 @@ const SHAPWaterfall: React.FC<SHAPWaterfallProps> = ({
 
           {/* Prediction reference line */}
           <ReferenceLine
-            x={prediction}
+            x={safePrediction}
             stroke="#1d4ed8"
             strokeDasharray="3 3"
             label={{ value: 'Prediction', position: 'top', fill: '#1d4ed8', fontSize: 11 }}
@@ -120,7 +135,7 @@ const SHAPWaterfall: React.FC<SHAPWaterfallProps> = ({
             tick={{ fontSize: 11 }}
             tickLine={false}
             axisLine={{ stroke: '#e5e7eb' }}
-            tickFormatter={(value) => value.toFixed(3)}
+            tickFormatter={(value) => formatNumber(value, 3)}
           />
 
           <YAxis

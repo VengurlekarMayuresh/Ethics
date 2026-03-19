@@ -518,6 +518,20 @@ async def get_explanation_by_prediction(
                         "task_state": task.state,
                         "info": task.info if task.info else None
                     }
+                elif task.failed():
+                    return {
+                        "status": "failed",
+                        "task_id": task_id,
+                        "task_state": task.state,
+                        "error": str(task.result) if task.result else "Task failed"
+                    }
+                elif task.state == "REVOKED":
+                    return {
+                        "status": "revoked",
+                        "task_id": task_id,
+                        "task_state": task.state,
+                        "detail": "Computation was cancelled"
+                    }
 
             raise HTTPException(status_code=404, detail="No explanation found for this prediction. Request one first.")
 
@@ -743,8 +757,33 @@ async def get_shap_dependence(
         import numpy as np
 
         if framework in ["sklearn", "xgboost", "lightgbm"]:
-            explainer = shap.TreeExplainer(model_obj)
-            shap_values = explainer.shap_values(X_full)
+            try:
+                from sklearn.pipeline import Pipeline
+                is_pipeline = isinstance(model_obj, Pipeline)
+            except Exception:
+                is_pipeline = False
+
+            if is_pipeline:
+                predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
+                explainer = shap.KernelExplainer(
+                    lambda x: predict_fn(pd.DataFrame(x, columns=X_full.columns)),
+                    X_full.iloc[:min(100, len(X_full))].values
+                )
+                shap_values = explainer.shap_values(X_full.values)
+            else:
+                try:
+                    explainer = shap.TreeExplainer(model_obj)
+                    shap_values = explainer.shap_values(X_full)
+                except Exception:
+                    # Some wrapped estimators under sklearn framework are not
+                    # compatible with TreeExplainer; use model-agnostic fallback.
+                    predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
+                    explainer = shap.KernelExplainer(
+                        lambda x: predict_fn(pd.DataFrame(x, columns=X_full.columns)),
+                        X_full.iloc[:min(100, len(X_full))].values
+                    )
+                    shap_values = explainer.shap_values(X_full.values)
+
             # For classification, shap_values might be a list (one per class)
             if isinstance(shap_values, list):
                 shap_values = shap_values[1]  # Use positive class for binary classification
