@@ -283,14 +283,14 @@ class ModelLoaderService:
 
             return 0
 
-        # Step 1: Extract RAW input feature names (before preprocessing)
+        # Step 1: Extract RAW input feature names (before preprocessing) and their types
+        feature_types = {}  # Map feature_name -> "categorical" or "numeric"
         if framework == "sklearn":
             from sklearn.pipeline import Pipeline
 
             # Check if model is a Pipeline
             if isinstance(model_obj, Pipeline):
-                # For pipelines, get feature names from the first step (preprocessing)
-                # ColumnTransformer stores feature_names_in_ if trained on DataFrame
+                # For pipelines, get feature names from the preprocessing step
                 preprocessing_step = None
                 for step_name, step in model_obj.steps:
                     if hasattr(step, 'transformers_') or hasattr(step, 'feature_names_in_'):
@@ -300,15 +300,40 @@ class ModelLoaderService:
                 if preprocessing_step and hasattr(preprocessing_step, 'feature_names_in_'):
                     # ColumnTransformer or similar: get the original feature names
                     feature_names = preprocessing_step.feature_names_in_.tolist()
+
+                    # Infer feature types by examining the ColumnTransformer's transformers
+                    # Categorical features are those handled by OneHotEncoder or similar
+                    if hasattr(preprocessing_step, 'transformers_'):
+                        for transformer_name, transformer_obj, cols in preprocessing_step.transformers_:
+                            # transformer_obj could be OneHotEncoder, StandardScaler, etc.
+                            if isinstance(transformer_obj, type) or hasattr(transformer_obj, '__module__'):
+                                # Check if it's a categorical transformer (OneHotEncoder)
+                                if 'OneHotEncoder' in transformer_obj.__class__.__name__:
+                                    for col in cols:
+                                        feature_types[col] = "categorical"
+                                elif any(num_type in transformer_obj.__class__.__name__ for num_type in ['StandardScaler', 'MinMaxScaler', 'Normalizer', 'MaxAbsScaler']):
+                                    for col in cols:
+                                        feature_types[col] = "numeric"
+                                else:
+                                    # Unknown transformer, mark as numeric by default
+                                    for col in cols:
+                                        feature_types[col] = "numeric"
+                            else:
+                                # Assume numeric for safety
+                                for col in cols:
+                                    feature_types[col] = "numeric"
+                    else:
+                        # Can't determine from transformers, use dataset analysis or defaults
+                        pass
+
                 elif hasattr(model_obj, 'feature_names_in_'):
-                    # Pipeline itself might have feature names if explicitly set
+                    # Pipeline itself might have feature names
                     feature_names = model_obj.feature_names_in_.tolist()
                 else:
-                    # Fallback: Use dataset analysis if available, otherwise create generic
+                    # Fallback
                     if dataset_analysis:
                         feature_names = list(dataset_analysis.keys())
                     else:
-                        # Try to infer from the final model's expected input count
                         final_model = model_obj.steps[-1][1] if model_obj.steps else model_obj
                         n_features = getattr(final_model, 'n_features_in_', None)
                         if n_features:
@@ -344,27 +369,41 @@ class ModelLoaderService:
 
         # Step 2: Build FeatureSchema objects, using dataset_analysis if available
         for name in feature_names:
+            # Determine feature type: prioritize dataset_analysis, then inferred types, then default
+            feature_type = "numeric"  # default
+            options = []
+
             if dataset_analysis and name in dataset_analysis:
-                # Use dataset analysis for this specific feature
                 analysis = dataset_analysis[name]
-                feature = FeatureSchema(
-                    name=name,
-                    type=analysis.get("type", "numeric"),
-                    options=analysis.get("options", []),
-                    min=analysis.get("min"),
-                    max=analysis.get("max"),
-                    mean=analysis.get("mean")
-                )
+                feature_type = analysis.get("type", "numeric")
+                options = analysis.get("options", [])
+            elif name in feature_types:
+                feature_type = feature_types[name]
+                # For categorical, we need to extract options from the transformer if possible
+                if feature_type == "categorical":
+                    # Try to get categories from the preprocessor
+                    if preprocessing_step and hasattr(preprocessing_step, 'transformers_'):
+                        for transformer_name, transformer_obj, cols in preprocessing_step.transformers_:
+                            if name in cols and hasattr(transformer_obj, 'categories_'):
+                                # Find index of this column in cols
+                                idx = list(cols).index(name)
+                                if idx < len(transformer_obj.categories_):
+                                    # Get unique values for this column, convert to strings
+                                    raw_cats = transformer_obj.categories_[idx]
+                                    options = [str(cat) for cat in raw_cats]
+                                break
             else:
-                # No dataset info for this feature, use defaults
-                feature = FeatureSchema(
-                    name=name,
-                    type="numeric",
-                    options=[],
-                    min=None,
-                    max=None,
-                    mean=None
-                )
+                # No type info, default numeric
+                feature_type = "numeric"
+
+            feature = FeatureSchema(
+                name=name,
+                type=feature_type,
+                options=options,
+                min=None,
+                max=None,
+                mean=None
+            )
             features.append(feature)
 
         return features

@@ -25,6 +25,20 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
+/* Make form input text darker and stronger for readability */
+input,
+select,
+textarea {
+  color: #111827;
+  font-weight: 600;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #4b5563;
+  font-weight: 500;
+}
+
 /* Accessibility: focus styles */
 *:focus-visible {
   outline: 2px solid #4f46e5; /* indigo-600 */

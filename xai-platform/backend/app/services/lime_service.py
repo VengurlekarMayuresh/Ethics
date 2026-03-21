@@ -7,9 +7,34 @@ from app.services.model_loader_service import ModelLoaderService
 import joblib
 import warnings
 warnings.filterwarnings('ignore')
+from sklearn.pipeline import Pipeline
 
 class LIMEService:
     """LIME explainer service for local explanations."""
+
+    @staticmethod
+    def _sanitize_training_array(training_array: np.ndarray) -> np.ndarray:
+        """
+        Ensure LIME background array has finite values and positive variance per column.
+        This prevents scipy.stats.truncnorm domain errors during perturbation sampling.
+        """
+        arr = np.asarray(training_array, dtype=float)
+
+        # Replace NaN/Inf with finite values.
+        arr = np.nan_to_num(arr, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            return arr
+
+        stds = arr.std(axis=0)
+        bad_cols = np.where((~np.isfinite(stds)) | (stds <= 1e-12))[0]
+        if bad_cols.size > 0 and arr.shape[0] > 1:
+            # Add tiny deterministic jitter only to problematic columns.
+            jitter = np.linspace(-1e-6, 1e-6, arr.shape[0])
+            for col in bad_cols:
+                arr[:, col] = arr[:, col] + jitter
+
+        return arr
 
     @staticmethod
     def create_explainer(
@@ -22,18 +47,92 @@ class LIMEService:
         """
         Create a LIME tabular explainer for the given model.
 
+        For pipelines, the training data is preprocessed to numeric space before creating the explainer.
+        For non-pipeline models, raw training data is used (must be numeric or have categorical features properly handled).
+
         Args:
             model: The trained model object
             framework: Model framework (sklearn, xgboost, etc.)
-            training_data: Background/training data for LIME
-            feature_names: Names of features
+            training_data: Background/training data for LIME (raw or preprocessed)
+            feature_names: Names of features (raw or preprocessed, depending on model type)
             mode: "regression" or "classification"
 
         Returns:
             LimeTabularExplainer instance
         """
-        # Convert training data to numpy
-        training_array = training_data.values
+        from sklearn.pipeline import Pipeline
+
+        # Check if model is a sklearn Pipeline
+        if isinstance(model, Pipeline):
+            # For pipelines, preprocess the training data to numeric space
+            # Find the preprocessing step
+            preprocessor = None
+            for step_name, step_obj in model.steps:
+                if hasattr(step_obj, 'transform'):
+                    preprocessor = step_obj
+                    break
+
+            if preprocessor is not None:
+                # Transform raw training data to preprocessed numeric features
+                training_processed = preprocessor.transform(training_data)
+                if hasattr(training_processed, 'toarray'):  # sparse matrix
+                    training_processed = training_processed.toarray()
+                training_array = np.asarray(training_processed, dtype=float)
+
+                # Try to get feature names from the preprocessor if available
+                processed_feature_names = None
+                if hasattr(preprocessor, 'get_feature_names_out'):
+                    try:
+                        # Get feature names from ColumnTransformer
+                        raw_names = preprocessor.get_feature_names_out()
+                        # Clean up names: remove prefix like 'cat__' or 'num__'
+                        cleaned_names = []
+                        for name in raw_names:
+                            if isinstance(name, bytes):
+                                name = name.decode('utf-8')
+                            # Remove transformer prefix (everything before '__')
+                            if '__' in name:
+                                name = name.split('__', 1)[1]
+                            cleaned_names.append(name)
+                        processed_feature_names = cleaned_names
+                    except Exception:
+                        processed_feature_names = None
+
+                if processed_feature_names is None or len(processed_feature_names) != training_array.shape[1]:
+                    # Fallback to generic names
+                    processed_feature_names = [f"feature_{i}" for i in range(training_array.shape[1])]
+
+                # No categorical features in preprocessed space (all numeric)
+                categorical_features = None
+            else:
+                # No preprocessor, use raw data as-is
+                training_array = training_data.values
+                processed_feature_names = feature_names
+                # Auto-detect categorical features
+                categorical_features = []
+                for i, col in enumerate(training_data.columns):
+                    if training_data[col].dtype == 'object' or training_data[col].dtype.name == 'category':
+                        categorical_features.append(i)
+                    elif len(training_data[col].unique()) <= 10 and training_data[col].dtype in ['int64', 'int32']:
+                        categorical_features.append(i)
+                if not categorical_features:
+                    categorical_features = None
+        else:
+            # Non-pipeline: use raw training data
+            training_array = training_data.values
+            processed_feature_names = feature_names
+            # Auto-detect categorical features
+            categorical_features = []
+            for i, col in enumerate(training_data.columns):
+                if training_data[col].dtype == 'object' or training_data[col].dtype.name == 'category':
+                    categorical_features.append(i)
+                elif len(training_data[col].unique()) <= 10 and training_data[col].dtype in ['int64', 'int32']:
+                    categorical_features.append(i)
+            if not categorical_features:
+                categorical_features = None
+
+        # Ensure stable/valid background stats for LIME perturbation sampling.
+        training_array = LIMEService._sanitize_training_array(training_array)
 
         # Determine if classification and number of classes
         num_classes = None
@@ -41,7 +140,12 @@ class LIMEService:
             try:
                 if hasattr(model, 'predict_proba'):
                     # For sklearn models
-                    preds = model.predict_proba(training_data[:min(10, len(training_data))])
+                    # Need to predict on preprocessed data if pipeline
+                    if isinstance(model, Pipeline):
+                        # Predict on preprocessed features
+                        preds = model.predict_proba(training_array)
+                    else:
+                        preds = model.predict_proba(training_data[:min(10, len(training_data))])
                     if isinstance(preds, list) and len(preds) > 1:
                         # Multi-class returns list of arrays
                         num_classes = len(preds)
@@ -53,12 +157,13 @@ class LIMEService:
         # Create explainer
         explainer = lime.lime_tabular.LimeTabularExplainer(
             training_array,
-            feature_names=feature_names,
+            feature_names=processed_feature_names,
             mode=mode,
             class_names=None,
             kernel_width=3,
             discretize_continuous=True,
             discretizer='quartile',
+            categorical_features=categorical_features,
             verbose=False
         )
 
@@ -70,48 +175,62 @@ class LIMEService:
         model,
         instance: np.ndarray,
         num_features: int = 10,
-        num_samples: int = 5000
+        num_samples: int = 5000,
+        raw_instance: Optional[np.ndarray] = None  # Optional raw input for reference
     ) -> Dict[str, Any]:
         """
         Generate LIME explanation for a single instance.
 
         Args:
-            explainer: LIME explainer instance
-            model: Model to explain
-            instance: Single data point (1D array)
+            explainer: LIME explainer instance (operates on preprocessed features if model is pipeline)
+            model: Model to explain (can be sklearn Pipeline)
+            instance: Single data point (1D array) in the explainer's feature space (preprocessed for pipelines)
             num_features: Number of top features to return
             num_samples: Number of samples LIME generates
+            raw_instance: Optional raw input instance (for extracting original feature values)
 
         Returns:
             Dictionary with explanation data
         """
-        # Define robust prediction function
-        def predict_fn(data):
-            # Convert DataFrame to numpy if needed
-            if isinstance(data, pd.DataFrame):
-                data = data.values
-            try:
-                # For models with predict_proba (e.g., sklearn classifiers)
-                if hasattr(model, 'predict_proba'):
-                    return model.predict_proba(data)
-                # For models with predict method (sklearn, xgboost, etc.)
-                elif hasattr(model, 'predict'):
-                    return model.predict(data)
-                # For ONNX Runtime inference sessions
-                elif hasattr(model, 'run') and callable(model.run):
-                    input_name = model.get_inputs()[0].name
-                    data_ = data.astype(np.float32)
-                    if data_.ndim == 1:
-                        data_ = data_.reshape(1, -1)
-                    outputs = model.run(None, {input_name: data_})
-                    return outputs[0]
-                # For callable model objects
-                elif callable(model):
-                    return model(data)
-                else:
-                    raise TypeError("Model does not have a compatible prediction interface")
-            except Exception as e:
-                raise RuntimeError(f"Prediction failed: {e}")
+        # Get feature names from explainer
+        feature_names = getattr(explainer, 'feature_names', None)
+
+        # Define prediction function based on model type
+        from sklearn.pipeline import Pipeline
+
+        if isinstance(model, Pipeline):
+            # For pipelines, the model expects raw input, but the explainer works on preprocessed data.
+            # We need a prediction function that maps preprocessed space back to raw? That's impossible.
+            # Actually, LIME will perturb in the explainer's space (preprocessed). We need to predict on that space.
+            # So we use the final estimator directly.
+            final_estimator = model.steps[-1][1]
+
+            if hasattr(final_estimator, 'predict_proba'):
+                predict_fn = final_estimator.predict_proba
+            else:
+                predict_fn = final_estimator.predict
+        else:
+            # For non-pipeline models, we may need to handle DataFrames if feature names available
+            if feature_names is not None:
+                def predict_fn(data):
+                    if isinstance(data, np.ndarray):
+                        df = pd.DataFrame(data, columns=feature_names)
+                    else:
+                        df = data
+                    if hasattr(model, 'predict_proba'):
+                        return model.predict_proba(df)
+                    elif hasattr(model, 'predict'):
+                        return model.predict(df)
+                    else:
+                        raise TypeError("Model has no prediction method")
+            else:
+                def predict_fn(data):
+                    if hasattr(model, 'predict_proba'):
+                        return model.predict_proba(data)
+                    elif hasattr(model, 'predict'):
+                        return model.predict(data)
+                    else:
+                        raise TypeError("Model has no prediction method")
 
         # Generate explanation
         exp = explainer.explain_instance(
@@ -123,10 +242,29 @@ class LIMEService:
         )
 
         # Extract explanation data
+        # exp.intercept can be: float, np.ndarray, or dict (for multi-class)
+        if isinstance(exp.intercept, dict):
+            # For classification with multiple classes, use intercept for the top predicted class
+            # or the first class if we can't determine
+            intercept_val = next(iter(exp.intercept.values())) if exp.intercept else 0.0
+        elif isinstance(exp.intercept, np.ndarray):
+            intercept_val = float(exp.intercept[0]) if exp.intercept.ndim > 0 else float(exp.intercept)
+        else:
+            intercept_val = float(exp.intercept)
+
+        # exp.local_pred can also be array or scalar
+        if isinstance(exp.local_pred, np.ndarray):
+            local_pred_val = float(exp.local_pred[0]) if exp.local_pred.ndim > 0 else float(exp.local_pred)
+        elif isinstance(exp.local_pred, dict):
+            # Use first value from dict if multi-class
+            local_pred_val = float(next(iter(exp.local_pred.values()))) if exp.local_pred else 0.0
+        else:
+            local_pred_val = float(exp.local_pred)
+
         explanation_data = {
-            "intercept": float(exp.intercept[0]) if isinstance(exp.intercept, np.ndarray) else float(exp.intercept),
+            "intercept": intercept_val,
             "local_exp": {},
-            "local_pred": float(exp.local_pred[0]) if isinstance(exp.local_pred, np.ndarray) else float(exp.local_pred),
+            "local_pred": local_pred_val,
             "list_of_contributions": []
         }
 
@@ -134,12 +272,21 @@ class LIMEService:
         if exp.local_exp:
             # For each label (usually just 1 for regression or top class)
             for label, contributions in exp.local_exp.items():
-                # contributions is a dict: {feature_index: weight}
-                sorted_contrib = sorted(contributions.items(), key=lambda x: abs(x[1]), reverse=True)
+                # contributions can be either a dict {feature_index: weight} or a list [(feature_index, weight), ...]
+                if isinstance(contributions, dict):
+                    contrib_iterable = contributions.items()
+                elif isinstance(contributions, list):
+                    # Convert list of tuples to (index, weight) pairs
+                    contrib_iterable = contributions
+                else:
+                    continue
+
+                sorted_contrib = sorted(contrib_iterable, key=lambda x: abs(x[1]), reverse=True)
 
                 feature_weights = []
                 for feature_idx, weight in sorted_contrib[:num_features]:
                     feature_name = explainer.feature_names[feature_idx]
+                    # For the value, we need the instance value in the explainer's space.
                     feature_value = instance[feature_idx] if feature_idx < len(instance) else None
                     feature_weights.append({
                         "feature": feature_name,
@@ -149,7 +296,7 @@ class LIMEService:
 
                 explanation_data["local_exp"][str(label)] = [
                     {"feature": explainer.feature_names[idx], "weight": float(weight)}
-                    for idx, weight in contributions.items()
+                    for idx, weight in contrib_iterable
                 ]
                 explanation_data["list_of_contributions"] = feature_weights
 

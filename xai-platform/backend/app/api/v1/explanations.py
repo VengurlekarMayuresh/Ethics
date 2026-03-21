@@ -764,12 +764,39 @@ async def get_shap_dependence(
                 is_pipeline = False
 
             if is_pipeline:
-                predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
-                explainer = shap.KernelExplainer(
-                    lambda x: predict_fn(pd.DataFrame(x, columns=X_full.columns)),
-                    X_full.iloc[:min(100, len(X_full))].values
-                )
-                shap_values = explainer.shap_values(X_full.values)
+                # For pipelines, preprocess the background data to numeric space
+                preprocessor = None
+                for step_name, step_obj in model_obj.steps:
+                    if hasattr(step_obj, 'transform'):
+                        preprocessor = step_obj
+                        break
+
+                if preprocessor is not None:
+                    X_processed = preprocessor.transform(X_full)
+                    if hasattr(X_processed, 'toarray'):
+                        X_processed = X_processed.toarray()
+                    X_numeric = np.asarray(X_processed, dtype=float)
+
+                    # Background subset for SHAP (use preprocessed numeric)
+                    bg = X_numeric[:min(100, len(X_numeric))]
+
+                    # Use final estimator for prediction on preprocessed data
+                    final_estimator = model_obj.steps[-1][1]
+                    if hasattr(final_estimator, 'predict_proba'):
+                        predict_fn = final_estimator.predict_proba
+                    else:
+                        predict_fn = final_estimator.predict
+
+                    explainer = shap.KernelExplainer(predict_fn, bg)
+                    shap_values = explainer.shap_values(X_numeric)
+                else:
+                    # No preprocessor, fall back to raw numeric
+                    predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
+                    explainer = shap.KernelExplainer(
+                        lambda x: predict_fn(pd.DataFrame(x, columns=X_full.columns)),
+                        X_full.iloc[:min(100, len(X_full))].values
+                    )
+                    shap_values = explainer.shap_values(X_full.values)
             else:
                 try:
                     explainer = shap.TreeExplainer(model_obj)

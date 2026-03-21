@@ -11,6 +11,8 @@ from datetime import datetime
 from bson import ObjectId
 import pickle
 import joblib
+from sklearn.pipeline import Pipeline
+import re
 
 @celery_app.task(bind=True, name="compute_shap_values")
 def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, Any]:
@@ -78,7 +80,7 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
                     # Keep column order aligned with current input.
                     background_data = background_data.reindex(columns=input_data.columns, fill_value=np.nan)
 
-            shap_values, expected_value = _compute_shap(model_obj, framework, input_data, background_data)
+            shap_values, expected_value, feature_names = _compute_shap(model_obj, framework, input_data, background_data)
 
             # Normalize SHAP values for frontend (ensure 2D array with one row)
             shap_values_norm, expected_value_norm = _normalize_shap_local(
@@ -95,7 +97,7 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
                 "explanation_type": "local",
                 "shap_values": shap_values_norm,
                 "expected_value": expected_value_norm,
-                "feature_names": list(input_data.columns) if hasattr(input_data, 'columns') else [],
+                "feature_names": feature_names,
                 "nl_explanation": None,  # TODO: Add NLG service
                 "task_id": self.request.id,
                 "task_status": "complete",
@@ -154,15 +156,25 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
                 # If no background data, sample from model's training data if available
                 raise ValueError("Background data is required for global SHAP computation")
 
-            shap_values, expected_value = _compute_shap(model_obj, framework, input_data, background_data)
+            shap_values, expected_value, feature_names = _compute_shap(model_obj, framework, input_data, background_data)
 
             self.update_state(state="PROGRESS", meta={"status": "calculating feature importance", "progress": 80})
+
+            # Handle classification case where shap_values may be a list (one array per class)
+            if isinstance(shap_values, list):
+                # For binary classification, use the positive class (index 1)
+                if len(shap_values) == 2:
+                    shap_values = shap_values[1]
+                else:
+                    # For multi-class, we could take mean across classes or use first class.
+                    # Here we'll take the mean absolute value across classes.
+                    shap_values = np.mean([np.abs(arr) for arr in shap_values], axis=0)
 
             # Calculate global importance
             mean_abs_shap = np.abs(shap_values).mean(axis=0)
             feature_importance = [
                 {"feature": name, "importance": float(value)}
-                for name, value in zip(input_data.columns, mean_abs_shap)
+                for name, value in zip(feature_names, mean_abs_shap)
             ]
 
             # Sort by importance
@@ -177,7 +189,7 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
                 "explanation_type": "global",
                 "shap_values": shap_values.tolist(),
                 "expected_value": expected_value.tolist() if isinstance(expected_value, np.ndarray) else float(expected_value),
-                "feature_names": list(input_data.columns),
+                "feature_names": feature_names,
                 "global_importance": feature_importance,
                 "task_id": self.request.id,
                 "task_status": "complete",
@@ -249,9 +261,28 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
                 mode=mode
             )
 
+            # Get feature names from explainer (may be preprocessed if pipeline)
+            explainer_feature_names = getattr(explainer, 'feature_names', list(training_df.columns))
+
             # Prepare input instance
             input_df = pd.DataFrame([prediction["input_data"]])
             input_values = input_df.values[0]
+
+            # For pipelines, preprocess the input instance to match the explainer's feature space
+            instance_to_explain = input_values
+            if isinstance(model_obj, Pipeline):
+                # Find preprocessor
+                preprocessor = None
+                for step_name, step_obj in model_obj.steps:
+                    if hasattr(step_obj, 'transform'):
+                        preprocessor = step_obj
+                        break
+                if preprocessor is not None:
+                    # Preprocess the input
+                    processed_input = preprocessor.transform(input_df)
+                    if hasattr(processed_input, 'toarray'):
+                        processed_input = processed_input.toarray()
+                    instance_to_explain = np.asarray(processed_input, dtype=float)[0]
 
             self.update_state(state="PROGRESS", meta={"status": "computing LIME values", "progress": 70})
 
@@ -259,7 +290,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             lime_data = LIMEService.explain_instance(
                 explainer,
                 model_obj,
-                input_values,
+                instance_to_explain,
                 num_features=num_features
             )
 
@@ -274,7 +305,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
                 "lime_weights": lime_data.get("list_of_contributions", []),
                 "lime_intercept": lime_data.get("intercept"),
                 "lime_local_pred": lime_data.get("local_pred"),
-                "feature_names": list(input_df.columns),
+                "feature_names": explainer_feature_names,
                 "nl_explanation": None,
                 "task_id": self.request.id,
                 "task_status": "complete",
@@ -333,7 +364,7 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
             # Determine mode
             mode = "classification" if model.get("task_type") in ["classification", "binary_classification", "multiclass_classification"] else "regression"
 
-            # Create explainer
+            # Create explainer (will preprocess background data if pipeline)
             explainer = LIMEService.create_explainer(
                 model_obj,
                 framework,
@@ -342,13 +373,33 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
                 mode=mode
             )
 
+            # Get feature names from explainer (may be preprocessed if pipeline)
+            explainer_feature_names = getattr(explainer, 'feature_names', list(background_df.columns))
+
             self.update_state(state="PROGRESS", meta={"status": "computing global LIME", "progress": 60})
+
+            # For global LIME, the samples passed to explain_global must be in the same space as the explainer.
+            # If pipeline, preprocess background_df; otherwise use as-is.
+            samples_for_explanation = background_df
+            if isinstance(model_obj, Pipeline):
+                # Preprocess to numeric space
+                preprocessor = None
+                for step_name, step_obj in model_obj.steps:
+                    if hasattr(step_obj, 'transform'):
+                        preprocessor = step_obj
+                        break
+                if preprocessor is not None:
+                    processed_bg = preprocessor.transform(background_df)
+                    if hasattr(processed_bg, 'toarray'):
+                        processed_bg = processed_bg.toarray()
+                    # Convert to DataFrame with feature names from explainer
+                    samples_for_explanation = pd.DataFrame(processed_bg, columns=explainer_feature_names)
 
             # Compute aggregated LIME importance
             lime_global = LIMEService.explain_global(
                 explainer,
                 model_obj,
-                background_df,
+                samples_for_explanation,
                 num_features=num_features
             )
 
@@ -361,7 +412,7 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
                 "explanation_type": "global",
                 "lime_weights": None,  # Individual weights not stored for global
                 "lime_global_importance": lime_global["feature_importance"],
-                "feature_names": list(background_df.columns),
+                "feature_names": explainer_feature_names,
                 # Keep SHAP fields as None to avoid mixing
                 "shap_values": None,
                 "expected_value": None,
@@ -391,34 +442,139 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
     from sklearn.pipeline import Pipeline
 
     try:
+        expected_columns = list(input_data.columns)
+
+        def _prepare_background(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+            """Ensure SHAP background data matches model input columns, tolerating name-style mismatches."""
+            if df is None or len(df) == 0:
+                return input_data[expected_columns]
+
+            bg_df = df.copy()
+
+            def _norm(name: Any) -> str:
+                # Normalize aggressively to handle case, spaces, dashes, punctuation, BOM-like noise.
+                text = str(name).strip().lower()
+                return re.sub(r"[^a-z0-9]+", "", text)
+
+            # Build normalized lookup for background columns.
+            bg_norm_to_actual = {}
+            for col in bg_df.columns:
+                norm_col = _norm(col)
+                if norm_col not in bg_norm_to_actual:
+                    bg_norm_to_actual[norm_col] = col
+
+            # Resolve expected columns to actual background columns.
+            resolved = {}
+            for col in expected_columns:
+                if col in bg_df.columns:
+                    resolved[col] = col
+                    continue
+                candidate = bg_norm_to_actual.get(_norm(col))
+                if candidate is not None:
+                    resolved[col] = candidate
+
+            missing = [c for c in expected_columns if c not in resolved]
+            if missing:
+                # Safe fallback: synthesize missing columns from the current input row
+                # rather than mapping by position (which can mis-map IDs/text fields).
+                input_row = input_data.iloc[0].to_dict()
+                for col in missing:
+                    if col in input_row:
+                        bg_df[col] = input_row[col]
+                        resolved[col] = col
+
+            missing_after_fill = [c for c in expected_columns if c not in resolved]
+            if missing_after_fill:
+                raise ValueError(
+                    f"Background data missing required columns: {missing_after_fill}. "
+                    f"Expected columns: {expected_columns}"
+                )
+
+            # Rename resolved columns to expected names, drop extras, and keep input order.
+            selected_actual_cols = [resolved[c] for c in expected_columns]
+            bg_df = bg_df[selected_actual_cols].copy()
+            bg_df.columns = expected_columns
+            return bg_df
+
+        # Initialize with input data columns as default feature names
+        final_feature_names = expected_columns
+
         # Check if model is a sklearn Pipeline
         if isinstance(model_obj, Pipeline):
-            # For pipelines, use KernelExplainer with the full pipeline
-            # This respects all preprocessing steps
+            # For pipelines, we need to work in the preprocessed feature space
+            # because the model expects numeric inputs after preprocessing
+
+            # Prepare background data (raw)
             if background_data is not None and len(background_data) > 0:
-                bg = background_data if len(background_data) <= 100 else background_data.iloc[:100]
+                bg_raw = background_data if len(background_data) <= 100 else background_data.iloc[:100]
+                bg = _prepare_background(bg_raw)
             else:
-                bg = input_data
+                bg = _prepare_background(input_data)
 
-            # Use the pipeline's predict method
-            predict_fn = model_obj.predict
+            # IMPORTANT: Preprocess the background data to numeric space
+            # Find the preprocessing step in the pipeline
+            preprocessor = None
+            for step_name, step_obj in model_obj.steps:
+                if hasattr(step_obj, 'transform'):
+                    preprocessor = step_obj
+                    break
 
-            def _predict_with_columns(values):
-                if isinstance(values, np.ndarray):
-                    df = pd.DataFrame(values, columns=input_data.columns)
+            if preprocessor is not None:
+                # Transform raw background to preprocessed numeric features
+                bg_processed = preprocessor.transform(bg)
+                if hasattr(bg_processed, 'toarray'):  # sparse matrix
+                    bg_processed = bg_processed.toarray()
+                bg_numeric = np.asarray(bg_processed, dtype=float)
+
+                # Try to get feature names from the preprocessor
+                if hasattr(preprocessor, 'get_feature_names_out'):
+                    try:
+                        raw_names = preprocessor.get_feature_names_out()
+                        cleaned_names = []
+                        for name in raw_names:
+                            if isinstance(name, bytes):
+                                name = name.decode('utf-8')
+                            if '__' in name:
+                                name = name.split('__', 1)[1]
+                            cleaned_names.append(name)
+                        final_feature_names = cleaned_names
+                    except Exception:
+                        # Fallback to generic feature names if extraction fails
+                        final_feature_names = [f"feature_{i}" for i in range(bg_numeric.shape[1])]
                 else:
-                    df = values
-                preds = predict_fn(df)
-                # Ensure return is numpy array
-                if isinstance(preds, np.ndarray):
-                    return preds
-                elif hasattr(preds, 'toarray'):
-                    return preds.toarray()
-                else:
-                    return np.array(preds)
+                    # No get_feature_names_out, use generic names
+                    final_feature_names = [f"feature_{i}" for i in range(bg_numeric.shape[1])]
+            else:
+                # No clear preprocessor, fall back to raw numeric (may fail if strings present)
+                bg_numeric = bg.values.astype(float)
+                # Keep default final_feature_names = expected_columns
 
-            explainer = shap.KernelExplainer(_predict_with_columns, bg.values)
-            shap_values = explainer.shap_values(input_data.values)
+            # Get the final estimator for prediction on preprocessed data
+            final_estimator = model_obj.steps[-1][1]
+
+            # Predict function works directly on preprocessed numeric data
+            if hasattr(final_estimator, 'predict_proba'):
+                predict_fn = final_estimator.predict_proba
+            else:
+                predict_fn = final_estimator.predict
+
+            def _predict_preprocessed(values):
+                # values is already in preprocessed space (numeric array)
+                return predict_fn(values)
+
+            # Create SHAP explainer in preprocessed feature space
+            explainer = shap.KernelExplainer(_predict_preprocessed, bg_numeric)
+
+            # Also preprocess the input data
+            if preprocessor is not None:
+                input_processed = preprocessor.transform(input_data)
+                if hasattr(input_processed, 'toarray'):
+                    input_processed = input_processed.toarray()
+                input_numeric = np.asarray(input_processed, dtype=float)
+            else:
+                input_numeric = input_data.values.astype(float)
+
+            shap_values = explainer.shap_values(input_numeric)
             expected_value = explainer.expected_value
 
         else:
@@ -430,25 +586,26 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
             except Exception:
                 # Fallback to KernelExplainer
                 if background_data is not None and len(background_data) > 0:
-                    bg = background_data if len(background_data) <= 100 else background_data.iloc[:100]
+                    bg_raw = background_data if len(background_data) <= 100 else background_data.iloc[:100]
+                    bg = _prepare_background(bg_raw)
                 else:
                     # Generate synthetic background if none provided
-                    bg = input_data
+                    bg = _prepare_background(input_data)
 
                 predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
 
                 def _predict_with_columns(values):
                     if isinstance(values, np.ndarray):
-                        df = pd.DataFrame(values, columns=input_data.columns)
+                        df = pd.DataFrame(values, columns=expected_columns)
                     else:
-                        df = values
+                        df = values[expected_columns] if isinstance(values, pd.DataFrame) else values
                     return predict_fn(df)
 
                 explainer = shap.KernelExplainer(_predict_with_columns, bg.values)
                 shap_values = explainer.shap_values(input_data.values)
                 expected_value = explainer.expected_value
 
-        return shap_values, expected_value
+        return shap_values, expected_value, final_feature_names
 
     except Exception as e:
         raise ValueError(f"SHAP computation failed: {str(e)}")
@@ -467,8 +624,6 @@ def _normalize_shap_local(
     - shap values as a single-row 2D list: [[f1, f2, ...]]
     - expected value as a scalar float
     """
-    feature_count = len(input_data.columns) if hasattr(input_data, "columns") else int(np.asarray(input_data).shape[-1])
-
     def _safe_float(value: Any, default: float = 0.0) -> float:
         try:
             return float(value)
@@ -487,37 +642,52 @@ def _normalize_shap_local(
             pass
         return 0
 
-    def _fit_feature_size(vec: np.ndarray) -> np.ndarray:
-        vec = np.asarray(vec, dtype=float).reshape(-1)
-        if vec.size < feature_count:
-            vec = np.pad(vec, (0, feature_count - vec.size), mode="constant")
-        elif vec.size > feature_count:
-            vec = vec[:feature_count]
-        return vec
-
-    # Normalize SHAP values to one feature vector for the current instance.
+    # Extract SHAP values for the local instance as a 1D array
     if isinstance(shap_values, list):
         if len(shap_values) == 0:
-            local_vec = np.zeros(feature_count, dtype=float)
+            # Empty SHAP values; return empty array
+            local_vec = np.array([], dtype=float)
         else:
             class_idx = _get_class_index(len(shap_values))
             arr = np.asarray(shap_values[class_idx], dtype=float)
-            local_vec = arr[0] if arr.ndim > 1 else arr
+            # arr could be shape (1, n_features) or (n_features,)
+            if arr.ndim > 1:
+                local_vec = arr[0]
+            else:
+                local_vec = arr
     else:
         arr = np.asarray(shap_values, dtype=float)
-        if arr.ndim == 1:
+        if arr.ndim == 0:
+            local_vec = np.array([float(arr)])
+        elif arr.ndim == 1:
             local_vec = arr
         elif arr.ndim == 2:
+            # Shape (n_instances, n_features); we want first instance
             local_vec = arr[0]
         elif arr.ndim >= 3:
-            # Common shape for multiclass can be (classes, samples, features).
-            class_idx = _get_class_index(arr.shape[0])
-            class_arr = np.asarray(arr[class_idx], dtype=float)
-            local_vec = class_arr[0] if class_arr.ndim > 1 else class_arr
-        else:
-            local_vec = np.zeros(feature_count, dtype=float)
+            # For 3D arrays, we need to handle two common SHAP output shapes:
+            # (classes, instances, features) from TreeExplainer or
+            # (instances, features, classes) from KernelExplainer
+            # Since we're explaining a single instance, the instance dimension should be 1.
 
-    local_vec = _fit_feature_size(local_vec)
+            # Check if shape looks like (instances, features, classes)
+            if arr.shape[0] == 1 and arr.ndim == 3 and arr.shape[2] > 1:
+                # Shape: (1, features, classes) - KernelExplainer output
+                class_idx = _get_class_index(arr.shape[2])
+                local_vec = arr[0, :, class_idx]
+            else:
+                # Assume shape: (classes, instances, features) - TreeExplainer output
+                class_idx = _get_class_index(arr.shape[0])
+                class_arr = np.asarray(arr[class_idx], dtype=float)
+                if class_arr.ndim > 1:
+                    local_vec = class_arr[0]
+                else:
+                    local_vec = class_arr
+        else:
+            local_vec = np.array([], dtype=float)
+
+    # Ensure 1D array
+    local_vec = np.asarray(local_vec, dtype=float).reshape(-1)
 
     # Normalize expected value to scalar.
     if isinstance(expected_value, (list, tuple, np.ndarray)):
