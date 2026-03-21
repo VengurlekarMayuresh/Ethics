@@ -12,6 +12,9 @@ interface FeatureSchema {
   type: 'numeric' | 'categorical';
   options?: string[];
   description?: string;
+  min?: number | null;
+  max?: number | null;
+  mean?: number | null;
 }
 
 interface PredictionFormProps {
@@ -70,8 +73,21 @@ export default function PredictionForm({
 
       if (value === undefined || value === '') {
         newErrors[feature.name] = `${feature.name} is required`;
-      } else if (feature.type === 'numeric' && isNaN(Number(value))) {
-        newErrors[feature.name] = `${feature.name} must be a number`;
+        return;
+      }
+
+      if (feature.type === 'numeric') {
+        const numValue = Number(value);
+        if (isNaN(numValue)) {
+          newErrors[feature.name] = `${feature.name} must be a number`;
+        } else {
+          if (feature.min !== null && feature.min !== undefined && numValue < feature.min) {
+            newErrors[feature.name] = `${feature.name} must be at least ${feature.min}`;
+          }
+          if (feature.max !== null && feature.max !== undefined && numValue > feature.max) {
+            newErrors[feature.name] = `${feature.name} must be at most ${feature.max}`;
+          }
+        }
       } else if (feature.type === 'categorical' && feature.options && !feature.options.includes(value)) {
         newErrors[feature.name] = `${feature.name} must be one of the allowed options`;
       }
@@ -138,17 +154,26 @@ export default function PredictionForm({
             )}
 
             {feature.type === 'numeric' && (
-              <input
-                type="number"
-                id={feature.name}
-                step="any"
-                value={formData[feature.name] ?? ''}
-                onChange={(e) => handleInputChange(feature.name, e.target.value, 'numeric')}
-                className={`block w-full rounded-lg border ${
-                  errors[feature.name] ? 'border-red-300' : 'border-gray-300'
-                } px-3 py-2 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 sm:text-sm`}
-                placeholder="Enter a number"
-              />
+              <div>
+                <input
+                  type="number"
+                  id={feature.name}
+                  step="any"
+                  value={formData[feature.name] ?? ''}
+                  onChange={(e) => handleInputChange(feature.name, e.target.value, 'numeric')}
+                  min={feature.min !== null && feature.min !== undefined ? feature.min : undefined}
+                  max={feature.max !== null && feature.max !== undefined ? feature.max : undefined}
+                  className={`block w-full rounded-lg border ${
+                    errors[feature.name] ? 'border-red-300' : 'border-gray-300'
+                  } px-3 py-2 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 sm:text-sm`}
+                  placeholder="Enter a number"
+                />
+                {feature.min !== null && feature.max !== null && (
+                  <p className="mt-1 text-xs text-gray-500">
+                    Range: {feature.min} to {feature.max}
+                  </p>
+                )}
+              </div>
             )}
 
             {errors[feature.name] && (

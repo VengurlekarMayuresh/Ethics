@@ -6,6 +6,9 @@ class FeatureSchema(BaseModel):
     name: str
     type: str # "numeric" | "categorical"
     options: Optional[List[str]] = []
+    min: Optional[float] = None  # For numeric features
+    max: Optional[float] = None  # For numeric features
+    mean: Optional[float] = None  # For numeric features (reference)
 
 class ModelBase(BaseModel):
     name: str
@@ -16,6 +19,7 @@ class ModelBase(BaseModel):
     protected_attributes: List[str] = []
     tags: List[str] = []
     version: str = "1.0"
+    background_data_path: Optional[str] = None  # Path to uploaded dataset for feature analysis
 
 class ModelCreate(ModelBase):
     pass
@@ -26,6 +30,7 @@ class ModelResponse(ModelBase):
     file_path: Optional[str] = None
     background_data_path: Optional[str] = None
     metrics: dict = {}
+    model_category: Optional[str] = None  # "linear", "tree", "neural_network", "unknown"
     created_at: datetime
     updated_at: datetime
 

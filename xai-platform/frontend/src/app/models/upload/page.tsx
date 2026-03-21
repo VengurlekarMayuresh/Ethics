@@ -17,7 +17,7 @@ const modelSchema = z.object({
     name: z.string().min(1, 'Feature name is required'),
     type: z.enum(['numeric', 'categorical']),
     options: z.string().optional() // Comma separated for categorical
-  })).min(1, 'At least one feature is required')
+  })).optional()  // Features are optional; will be auto-detected if omitted
 });
 
 type ModelForm = z.infer<typeof modelSchema>;
@@ -25,7 +25,8 @@ type ModelForm = z.infer<typeof modelSchema>;
 export default function ModelUpload() {
   const router = useRouter();
   const [step, setStep] = useState(1);
-  const [file, setFile] = useState<File | null>(null);
+  const [modelFile, setModelFile] = useState<File | null>(null);
+  const [datasetFile, setDatasetFile] = useState<File | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState('');
 
@@ -34,7 +35,7 @@ export default function ModelUpload() {
     defaultValues: {
       framework: 'sklearn',
       task_type: 'classification',
-      features: [{ name: '', type: 'numeric', options: '' }]
+      features: []  // Empty by default; auto-detection will be used
     }
   });
 
@@ -43,14 +44,20 @@ export default function ModelUpload() {
     name: 'features'
   });
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleModelFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
+      setModelFile(e.target.files[0]);
+    }
+  };
+
+  const handleDatasetFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      setDatasetFile(e.target.files[0]);
     }
   };
 
   const nextStep = () => {
-    if (step === 1 && !file) {
+    if (step === 1 && !modelFile) {
       setError('Please upload a model file');
       return;
     }
@@ -63,7 +70,7 @@ export default function ModelUpload() {
   };
 
   const onSubmit = async (data: ModelForm) => {
-    if (!file) {
+    if (!modelFile) {
       setError('Model file is required');
       return;
     }
@@ -71,8 +78,9 @@ export default function ModelUpload() {
     try {
       setIsSubmitting(true);
       setError('');
-      
-      const formattedFeatures = data.features.map(f => ({
+
+      // Only include features if they were manually defined
+      const formattedFeatures = (data.features || []).map(f => ({
         name: f.name,
         type: f.type,
         options: f.type === 'categorical' && f.options ? f.options.split(',').map(s => s.trim()) : []
@@ -84,7 +92,11 @@ export default function ModelUpload() {
       formData.append('framework', data.framework);
       formData.append('task_type', data.task_type);
       formData.append('feature_schema', JSON.stringify(formattedFeatures));
-      formData.append('file', file);
+      formData.append('file', modelFile);
+
+      if (datasetFile) {
+        formData.append('background_data', datasetFile);
+      }
 
       await api.post('/models/upload', formData);
 
@@ -92,9 +104,11 @@ export default function ModelUpload() {
     } catch (err: any) {
       console.error(err);
       const detail = err.response?.data?.detail;
-      const errorMessage = typeof detail === 'string' 
-        ? detail 
-        : (Array.isArray(detail) ? JSON.stringify(detail) : 'Failed to upload model. Please check the API server.');
+      const errorMessage = typeof detail === 'string'
+        ? detail
+        : Array.isArray(detail)
+          ? detail.map((d: any) => d?.msg || d?.message || JSON.stringify(d)).join(' | ')
+          : (detail?.message || detail?.error || 'Failed to upload model. Please check the API server.');
       setError(errorMessage);
     } finally {
       setIsSubmitting(false);
@@ -141,28 +155,55 @@ export default function ModelUpload() {
             <h2 className="text-xl font-semibold text-gray-900 mb-6">Step 1: Upload & Initial Metadata</h2>
             
             <div className="space-y-6">
-              {/* File Upload Area */}
+              {/* Model File Upload Area */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Model File</label>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Model File *</label>
                 <div className="mt-1 flex justify-center rounded-xl border-2 border-dashed border-gray-300 px-6 pt-5 pb-6 hover:bg-gray-50 transition-colors">
                   <div className="space-y-1 text-center">
                     <UploadCloud className="mx-auto h-12 w-12 text-indigo-500" />
                     <div className="flex text-sm text-gray-600 mt-4 justify-center">
-                      <label htmlFor="file-upload" className="relative cursor-pointer rounded-md bg-white font-medium text-indigo-600 focus-within:outline-none focus-within:ring-2 focus-within:ring-indigo-500 focus-within:ring-offset-2 hover:text-indigo-500">
-                        <span>Upload a file</span>
-                        <input id="file-upload" type="file" className="sr-only" onChange={handleFileChange} accept=".pkl,.joblib,.h5,.onnx,.json" />
+                      <label htmlFor="model-file-upload" className="relative cursor-pointer rounded-md bg-white font-medium text-indigo-600 focus-within:outline-none focus-within:ring-2 focus-within:ring-indigo-500 focus-within:ring-offset-2 hover:text-indigo-500">
+                        <span>Upload a model file</span>
+                        <input id="model-file-upload" type="file" className="sr-only" onChange={handleModelFileChange} accept=".pkl,.joblib,.h5,.onnx,.json" />
                       </label>
                       <p className="pl-1">or drag and drop</p>
                     </div>
                     <p className="text-xs text-gray-500 mt-2">.pkl, .joblib, .onnx, .h5, .json up to 100MB</p>
-                    {file && (
+                    {modelFile && (
                       <div className="mt-4 p-2 bg-indigo-50 rounded text-indigo-700 text-sm font-medium flex items-center justify-center">
                         <CheckCircle2 className="h-4 w-4 mr-2" />
-                        Selected: {file.name} ({(file.size / (1024*1024)).toFixed(2)} MB)
+                        Selected: {modelFile.name} ({(modelFile.size / (1024*1024)).toFixed(2)} MB)
                       </div>
                     )}
                   </div>
                 </div>
+              </div>
+
+              {/* Optional Dataset Upload Area */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Dataset (Optional)</label>
+                <div className="mt-1 flex justify-center rounded-xl border-2 border-dashed border-gray-300 px-6 pt-5 pb-6 hover:bg-gray-50 transition-colors">
+                  <div className="space-y-1 text-center">
+                    <UploadCloud className="mx-auto h-12 w-12 text-green-500" />
+                    <div className="flex text-sm text-gray-600 mt-4 justify-center">
+                      <label htmlFor="dataset-file-upload" className="relative cursor-pointer rounded-md bg-white font-medium text-green-600 focus-within:outline-none focus-within:ring-2 focus-within:ring-green-500 focus-within:ring-offset-2 hover:text-green-500">
+                        <span>Upload a CSV dataset</span>
+                        <input id="dataset-file-upload" type="file" className="sr-only" onChange={handleDatasetFileChange} accept=".csv" />
+                      </label>
+                      <p className="pl-1">or drag and drop</p>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-2">.csv format. Used for auto-detecting feature names, types, and ranges.</p>
+                    {datasetFile && (
+                      <div className="mt-4 p-2 bg-green-50 rounded text-green-700 text-sm font-medium flex items-center justify-center">
+                        <CheckCircle2 className="h-4 w-4 mr-2" />
+                        Selected: {datasetFile.name} ({(datasetFile.size / (1024*1024)).toFixed(2)} MB)
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <p className="mt-2 text-sm text-gray-500">
+                  Providing a dataset helps automatically determine feature types (numeric/categorical) and valid ranges.
+                </p>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -205,11 +246,19 @@ export default function ModelUpload() {
             </div>
           </div>
 
-          {/* Step 2: Feature Schema */}
+          {/* Step 2: Feature Schema (Optional) */}
           <div className={`p-8 ${step !== 2 ? 'hidden' : ''}`}>
-            <h2 className="text-xl font-semibold text-gray-900 mb-2">Step 2: Model Input Features</h2>
-            <p className="text-gray-500 text-sm mb-6">Define the exact inputs your model expects. This will be used to generate prediction forms and label SHAP charts.</p>
-            
+            <h2 className="text-xl font-semibold text-gray-900 mb-2">Step 2: Model Input Features (Optional)</h2>
+            <p className="text-gray-500 text-sm mb-6">Define the exact inputs your model expects. If left blank, the system will automatically detect features from the model or dataset. This will be used to generate prediction forms and label SHAP charts.</p>
+
+            {fields.length === 0 && (
+              <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                <p className="text-sm text-blue-800">
+                  No manual features defined. Auto-detection will be attempted from the model file and/or uploaded dataset.
+                </p>
+              </div>
+            )}
+
             <div className="space-y-4">
               {fields.map((field, index) => {
                 const type = watch(`features.${index}.type`);
@@ -233,7 +282,7 @@ export default function ModelUpload() {
                           <option value="categorical">Categorical</option>
                         </select>
                       </div>
-                      
+
                       {type === 'categorical' && (
                         <div className="md:col-span-2">
                           <label className="block text-xs font-medium text-gray-700 mb-1">Categories (Comma separated)</label>
@@ -247,7 +296,7 @@ export default function ModelUpload() {
             </div>
 
             <button type="button" onClick={() => append({ name: '', type: 'numeric', options: '' })} className="mt-4 flex items-center text-sm font-medium text-indigo-600 hover:text-indigo-700">
-              <Plus className="mr-1 h-4 w-4" /> Add Feature
+              <Plus className="mr-1 h-4 w-4" /> Add Feature (Manual override)
             </button>
 
             <div className="flex justify-between pt-8 border-t border-gray-100 mt-8">

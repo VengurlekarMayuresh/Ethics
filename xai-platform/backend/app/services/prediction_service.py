@@ -76,6 +76,12 @@ class PredictionService:
                         df[feature_name] = pd.to_numeric(df[feature_name])
                     except (ValueError, TypeError):
                         raise ValueError(f"Feature '{feature_name}' must be numeric")
+                    # Validate min/max constraints if defined
+                    value = float(df[feature_name].iloc[0])
+                    if schema.min is not None and value < schema.min:
+                        raise ValueError(f"Feature '{feature_name}' must be >= {schema.min}")
+                    if schema.max is not None and value > schema.max:
+                        raise ValueError(f"Feature '{feature_name}' must be <= {schema.max}")
                 elif feature_type == "categorical":
                     if schema.options and df[feature_name][0] not in schema.options:
                         raise ValueError(f"Value for '{feature_name}' must be one of: {schema.options}")

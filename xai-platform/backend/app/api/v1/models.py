@@ -1,13 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Request
-from app.models.model_meta import ModelCreate, ModelResponse, FeatureSchema
+from app.models.model_meta import ModelResponse, FeatureSchema
 from app.api.v1.auth import get_current_user
 from app.db.mongo import get_db
+from app.services.model_loader_service import ModelLoaderService
 from app.utils.file_handler import storage
 from app.utils.audit_logger import log_action, AuditActions
 from datetime import datetime
 from bson import ObjectId
 import json
-from typing import List
+from typing import List, Optional
 
 router = APIRouter()
 
@@ -18,19 +19,82 @@ async def upload_model(
     description: str = Form(""),
     framework: str = Form(...),
     task_type: str = Form(...),
-    feature_schema: str = Form("[]"), # JSON string
+    feature_schema: str = Form("[]"),  # JSON string, optional (auto-generated if empty)
     file: UploadFile = File(...),
+    background_data: UploadFile = File(None),  # Optional CSV dataset
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        schema = json.loads(feature_schema)
+        manual_schema = json.loads(feature_schema) if feature_schema.strip() else []
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid feature_schema JSON")
 
-    # Read and upload file to MinIO
-    file_content = await file.read()
-    object_name = f"{current_user['_id']}/{int(datetime.utcnow().timestamp())}_{file.filename}"
-    await storage.upload_file(file_content, object_name)
+    # Read model file content
+    model_file_content = await file.read()
+    if not model_file_content:
+        raise HTTPException(status_code=400, detail="Model file is empty")
+
+    # Load model for analysis (without storing yet)
+    try:
+        model_obj, detected_framework = await ModelLoaderService.load_model_from_bytes(
+            model_file_content, file.filename
+        )
+        # Use detected framework from file extension
+        framework_to_use = detected_framework
+
+        # Attempt to detect task_type from model as well
+        model_info = await ModelLoaderService.get_model_info(model_obj, framework_to_use)
+        detected_task_type = model_info.get("task_type", "unknown")
+        task_type_to_use = detected_task_type if detected_task_type != "unknown" else task_type
+    except Exception as e:
+        msg = str(e)
+        if not msg.lower().startswith("failed to load model"):
+            msg = f"Failed to load model: {msg}"
+        raise HTTPException(status_code=400, detail=msg)
+
+    # Analyze dataset if provided
+    dataset_analysis = None
+    background_data_path = None
+    if background_data:
+        dataset_bytes = await background_data.read()
+        if dataset_bytes:
+            try:
+                dataset_analysis = await ModelLoaderService.analyze_dataset(dataset_bytes)
+                # Upload dataset to storage
+                bg_object_name = f"{current_user['_id']}/background_{int(datetime.utcnow().timestamp())}_{background_data.filename}"
+                await storage.upload_file(dataset_bytes, bg_object_name)
+                background_data_path = bg_object_name
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to analyze dataset: {str(e)}")
+
+    # Generate or use feature schema
+    if not manual_schema:
+        # Auto-generate from model and optionally dataset
+        feature_schema_objs = await ModelLoaderService.generate_feature_schema(
+            model_obj, framework_to_use, dataset_analysis
+        )
+        # Convert to dict list for storage
+        schema_to_store = [fs.dict() for fs in feature_schema_objs]
+    else:
+        # Use manually provided schema (override auto-generation)
+        schema_to_store = manual_schema
+
+    # Ensure we have at least some features; otherwise model unusable
+    if not schema_to_store:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not detect feature names. Please provide a feature schema manually or upload a dataset alongside the model."
+        )
+
+    # Upload model file to storage
+    model_object_name = f"{current_user['_id']}/{int(datetime.utcnow().timestamp())}_{file.filename}"
+    await storage.upload_file(model_file_content, model_object_name)
+
+    # Optionally detect model category (could store for explainability)
+    try:
+        model_category = await ModelLoaderService.detect_model_category(model_obj, framework_to_use)
+    except:
+        model_category = "unknown"
 
     # Save metadata to DB
     db = await get_db()
@@ -38,18 +102,20 @@ async def upload_model(
         "user_id": current_user["_id"],
         "name": name,
         "description": description,
-        "framework": framework,
-        "task_type": task_type,
-        "feature_schema": schema,
-        "file_path": object_name,
+        "framework": framework_to_use,
+        "task_type": task_type_to_use,
+        "feature_schema": schema_to_store,
+        "file_path": model_object_name,
+        "background_data_path": background_data_path,
         "protected_attributes": [],
         "tags": [],
         "version": "1.0",
         "metrics": {},
+        "model_category": model_category,  # Store for explainability
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow()
     }
-    
+
     result = await db.models.insert_one(model_doc)
     model_doc["_id"] = str(result.inserted_id)
 
@@ -59,7 +125,7 @@ async def upload_model(
         action=AuditActions.MODEL_UPLOAD,
         resource_type="model",
         resource_id=str(result.inserted_id),
-        details={"name": name, "framework": framework, "task_type": task_type},
+        details={"name": name, "framework": framework_to_use, "task_type": task_type, "auto_features": not manual_schema},
         request=request
     )
 

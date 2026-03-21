@@ -25,6 +25,9 @@ interface FeatureSchema {
   type: 'numeric' | 'categorical';
   options?: string[];
   description?: string;
+  min?: number | null;
+  max?: number | null;
+  mean?: number | null;
 }
 
 interface Model {
