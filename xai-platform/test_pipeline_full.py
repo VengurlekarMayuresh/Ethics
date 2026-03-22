@@ -252,7 +252,8 @@ try:
     else:
         predict_fn = final_estimator.predict
 
-    # Create SHAP explainer in preprocessed feature space
+    # Create SHAP explainer in preprocessed feature space (deterministic)
+    np.random.seed(42)
     explainer = shap.KernelExplainer(predict_fn, background_numeric)
 
     # Preprocess the test sample

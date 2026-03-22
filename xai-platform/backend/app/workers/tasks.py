@@ -160,6 +160,44 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
 
             self.update_state(state="PROGRESS", meta={"status": "calculating feature importance", "progress": 80})
 
+            # Normalize shap_values to 2D array (n_instances, n_features) for global importance
+            if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+                # For classification, shap_values may have shape (instances, features, classes) or (classes, instances, features)
+                # Use expected_value to detect class axis if possible
+                class_axis = None
+                if isinstance(expected_value, (np.ndarray, list, tuple)) and not isinstance(expected_value, str):
+                    ev_arr = np.asarray(expected_value)
+                    if ev_arr.ndim == 1 and ev_arr.size > 1:
+                        for axis, size in enumerate(shap_values.shape):
+                            if size == ev_arr.size:
+                                class_axis = axis
+                                break
+                if class_axis is None:
+                    # Heuristic: if last dimension is small (2 or 3), likely class axis
+                    if shap_values.shape[2] <= 5 and shap_values.shape[1] > shap_values.shape[2]:
+                        class_axis = 2
+                    else:
+                        class_axis = 0
+                # Move class axis to front
+                if class_axis != 0:
+                    shap_values = np.moveaxis(shap_values, class_axis, 0)
+                # Now shap_values.shape[0] is number of classes
+                # For global importance, we can either:
+                # - Use positive class (index 1) for binary classification
+                # - Take mean absolute across classes for multi-class
+                if shap_values.shape[0] >= 2:
+                    # Binary classification: use positive class (index 1)
+                    shap_values = shap_values[1]  # shape (instances, features) or still >2D?
+                else:
+                    shap_values = shap_values[0]
+                # Ensure shap_values is 2D (instances, features)
+                if shap_values.ndim > 2:
+                    # If there are extra dimensions, average them out (unlikely)
+                    # For safety, collapse all but the last dimension (features)
+                    # Assuming last dim is features
+                    shap_values = np.mean(shap_values, axis=tuple(range(shap_values.ndim - 1)))
+                # Now shap_values should be 2D
+
             # Handle classification case where shap_values may be a list (one array per class)
             if isinstance(shap_values, list):
                 # For binary classification, use the positive class (index 1)
@@ -562,7 +600,8 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                 # values is already in preprocessed space (numeric array)
                 return predict_fn(values)
 
-            # Create SHAP explainer in preprocessed feature space
+            # Create SHAP explainer in preprocessed feature space (seed for reproducibility)
+            np.random.seed(42)  # Ensure deterministic sampling
             explainer = shap.KernelExplainer(_predict_preprocessed, bg_numeric)
 
             # Also preprocess the input data
@@ -601,6 +640,7 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                         df = values[expected_columns] if isinstance(values, pd.DataFrame) else values
                     return predict_fn(df)
 
+                np.random.seed(42)  # Ensure deterministic sampling
                 explainer = shap.KernelExplainer(_predict_with_columns, bg.values)
                 shap_values = explainer.shap_values(input_data.values)
                 expected_value = explainer.expected_value

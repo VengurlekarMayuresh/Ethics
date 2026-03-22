@@ -787,11 +787,13 @@ async def get_shap_dependence(
                     else:
                         predict_fn = final_estimator.predict
 
+                    np.random.seed(42)  # Ensure deterministic sampling
                     explainer = shap.KernelExplainer(predict_fn, bg)
                     shap_values = explainer.shap_values(X_numeric)
                 else:
                     # No preprocessor, fall back to raw numeric
                     predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
+                    np.random.seed(42)  # Ensure deterministic sampling
                     explainer = shap.KernelExplainer(
                         lambda x: predict_fn(pd.DataFrame(x, columns=X_full.columns)),
                         X_full.iloc[:min(100, len(X_full))].values
@@ -805,6 +807,7 @@ async def get_shap_dependence(
                     # Some wrapped estimators under sklearn framework are not
                     # compatible with TreeExplainer; use model-agnostic fallback.
                     predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
+                    np.random.seed(42)  # Ensure deterministic sampling
                     explainer = shap.KernelExplainer(
                         lambda x: predict_fn(pd.DataFrame(x, columns=X_full.columns)),
                         X_full.iloc[:min(100, len(X_full))].values
@@ -818,6 +821,7 @@ async def get_shap_dependence(
             # For ONNX, use KernelExplainer with a small subset due to complexity
             # Or use a simpler approach
             from shap.maskers import Independent
+            np.random.seed(42)  # Ensure deterministic sampling
             explainer = shap.KernelExplainer(
                 lambda x: model_obj.run(None, {model_obj.get_inputs()[0].name: x.astype(np.float32)})[0],
                 X_full.iloc[:min(100, len(X_full))]  # Use subset for background
@@ -825,6 +829,7 @@ async def get_shap_dependence(
             shap_values = explainer.shap_values(X_full)
         else:
             # Fallback to KernelExplainer for unknown frameworks
+            np.random.seed(42)  # Ensure deterministic sampling
             explainer = shap.KernelExplainer(
                 lambda x: model_obj.predict(pd.DataFrame(x, columns=X_full.columns)),
                 X_full.iloc[:min(100, len(X_full))]
