@@ -305,21 +305,16 @@ class ModelLoaderService:
                     # Categorical features are those handled by OneHotEncoder or similar
                     if hasattr(preprocessing_step, 'transformers_'):
                         for transformer_name, transformer_obj, cols in preprocessing_step.transformers_:
-                            # transformer_obj could be OneHotEncoder, StandardScaler, etc.
-                            if isinstance(transformer_obj, type) or hasattr(transformer_obj, '__module__'):
-                                # Check if it's a categorical transformer (OneHotEncoder)
-                                if 'OneHotEncoder' in transformer_obj.__class__.__name__:
-                                    for col in cols:
-                                        feature_types[col] = "categorical"
-                                elif any(num_type in transformer_obj.__class__.__name__ for num_type in ['StandardScaler', 'MinMaxScaler', 'Normalizer', 'MaxAbsScaler']):
-                                    for col in cols:
-                                        feature_types[col] = "numeric"
-                                else:
-                                    # Unknown transformer, mark as numeric by default
-                                    for col in cols:
-                                        feature_types[col] = "numeric"
+                            # Check the transformer's class to determine feature type
+                            transformer_class = transformer_obj.__class__.__name__
+                            if 'OneHotEncoder' in transformer_class:
+                                for col in cols:
+                                    feature_types[col] = "categorical"
+                            elif any(num_type in transformer_class for num_type in ['StandardScaler', 'MinMaxScaler', 'Normalizer', 'MaxAbsScaler']):
+                                for col in cols:
+                                    feature_types[col] = "numeric"
                             else:
-                                # Assume numeric for safety
+                                # Unknown transformer, mark as numeric by default
                                 for col in cols:
                                     feature_types[col] = "numeric"
                     else:
