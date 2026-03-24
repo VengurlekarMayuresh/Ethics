@@ -473,6 +473,7 @@ async def get_global_lime(
 @router.get("/prediction/{prediction_id}")
 async def get_explanation_by_prediction(
     prediction_id: str,
+    method: str = None,  # Optional filter: 'shap' or 'lime'
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -490,14 +491,17 @@ async def get_explanation_by_prediction(
         if not prediction:
             raise HTTPException(status_code=404, detail="Prediction not found")
 
-        # Find explanation for this prediction (any method, local).
-        # Support both legacy string IDs and ObjectId storage formats.
+        # Find explanation for this prediction (local and optionally filtered by method)
         prediction_id_filters = [{"prediction_id": prediction_id}]
         if ObjectId.is_valid(prediction_id):
             prediction_id_filters.append({"prediction_id": ObjectId(prediction_id)})
 
+        filter_query = {"$or": prediction_id_filters, "explanation_type": "local"}
+        if method in ('shap', 'lime'):
+            filter_query["method"] = method
+
         explanation = await db.explanations.find_one(
-            {"$and": [{"$or": prediction_id_filters}, {"explanation_type": "local"}]},
+            filter_query,
             sort=[("created_at", -1)]
         )
 
@@ -507,8 +511,15 @@ async def get_explanation_by_prediction(
             explanation["prediction_id"] = str(explanation["prediction_id"])
             return explanation
         else:
-            # If explanation was requested but not finished yet, expose task status.
-            task_id = prediction.get("explanation_task_id") or prediction.get("lime_task_id")
+            # If explanation not found, check if a task is pending for the requested method
+            task_id = None
+            if method == 'shap':
+                task_id = prediction.get("explanation_task_id")
+            elif method == 'lime':
+                task_id = prediction.get("lime_task_id")
+            else:
+                task_id = prediction.get("explanation_task_id") or prediction.get("lime_task_id")
+
             if task_id:
                 task = celery_app.AsyncResult(task_id)
                 if not task.ready():

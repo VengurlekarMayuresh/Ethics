@@ -233,13 +233,14 @@ class LIMEService:
                         raise TypeError("Model has no prediction method")
 
         # Generate explanation
-        exp = explainer.explain_instance(
-            instance,
-            predict_fn,
-            num_features=min(num_features, len(explainer.feature_names)),
-            num_samples=num_samples,
-            top_labels=1  # Get explanation for top predicted class
-        )
+        explain_kwargs = {
+            "num_features": min(num_features, len(explainer.feature_names)),
+            "num_samples": num_samples,
+        }
+        # Only pass top_labels for classification mode
+        if getattr(explainer, 'mode', None) == 'classification':
+            explain_kwargs["top_labels"] = 1
+        exp = explainer.explain_instance(instance, predict_fn, **explain_kwargs)
 
         # Extract explanation data
         # exp.intercept can be: float, np.ndarray, or dict (for multi-class)
@@ -299,6 +300,99 @@ class LIMEService:
                     for idx, weight in contrib_iterable
                 ]
                 explanation_data["list_of_contributions"] = feature_weights
+
+        # ------------------------------------------------------------
+        # AGGREGATION: For pipelines with OneHotEncoder, combine
+        # one-hot encoded features back to original categorical features.
+        # ------------------------------------------------------------
+        if 'local_exp' in explanation_data and explanation_data['local_exp'] and isinstance(model, Pipeline):
+            from collections import defaultdict
+            from sklearn.pipeline import Pipeline
+
+            # Find preprocessor
+            preprocessor = None
+            for step_name, step_obj in model.steps:
+                if hasattr(step_obj, 'transform'):
+                    preprocessor = step_obj
+                    break
+
+            if preprocessor and hasattr(explainer, 'feature_names'):
+                # Build mapping: preprocessed feature index -> original categorical feature name
+                encoded_to_original = {}
+                original_feature_names_set = set()
+
+                if hasattr(preprocessor, 'transformers_'):
+                    for transformer_name, transformer_obj, cols in preprocessor.transformers_:
+                        transformer_class = transformer_obj.__class__.__name__
+
+                        for col in cols:
+                            original_feature_names_set.add(col)
+                            # Match encoded features to original column using normalized names
+                            for idx, fname in enumerate(explainer.feature_names):
+                                if isinstance(fname, bytes):
+                                    fname = fname.decode('utf-8')
+                                fname_str = str(fname)
+                                # Normalize: remove transformer prefix if present (e.g., "cat__name_X" -> "name_X")
+                                if '__' in fname_str:
+                                    parts = fname_str.split('__', 1)
+                                    norm_name = parts[1] if len(parts) == 2 else fname_str
+                                else:
+                                    norm_name = fname_str
+                                # Match: exact match for numeric features, or starts with "col_" for one-hot
+                                if norm_name == col or norm_name.startswith(col + '_'):
+                                    encoded_to_original[idx] = col
+
+                # Perform aggregation if we have a mapping
+                if encoded_to_original:
+                    new_local_exp = {}
+                    for label_str, contrib_list in explanation_data['local_exp'].items():
+                        aggregated_contrib = defaultdict(float)
+                        # contrib_list: list of {"feature": name, "weight": val}
+                        for item in contrib_list:
+                            feat_name = item['feature']
+                            # Find index of this feature in explainer.feature_names
+                            try:
+                                idx = list(explainer.feature_names).index(feat_name)
+                            except ValueError:
+                                # Can't find - keep as-is
+                                aggregated_contrib[feat_name] += item['weight']
+                                continue
+
+                            original = encoded_to_original.get(idx)
+                            if original:
+                                aggregated_contrib[original] += item['weight']
+                            else:
+                                # Unmapped feature - keep as-is
+                                aggregated_contrib[feat_name] += item['weight']
+
+                        # Sort by absolute weight
+                        new_local_exp[label_str] = [
+                            {"feature": feat, "weight": w}
+                            for feat, w in sorted(aggregated_contrib.items(), key=lambda x: abs(x[1]), reverse=True)
+                        ]
+
+                    explanation_data['local_exp'] = new_local_exp
+
+                    # Update list_of_contributions similarly
+                    if 'list_of_contributions' in explanation_data and explanation_data['list_of_contributions']:
+                        aggregated_contrib2 = defaultdict(float)
+                        for item in explanation_data['list_of_contributions']:
+                            feat_name = item['feature']
+                            try:
+                                idx = list(explainer.feature_names).index(feat_name)
+                            except ValueError:
+                                aggregated_contrib2[feat_name] += abs(item.get('weight', 0))
+                                continue
+                            original = encoded_to_original.get(idx)
+                            if original:
+                                aggregated_contrib2[original] += abs(item.get('weight', 0))
+                            else:
+                                aggregated_contrib2[feat_name] += abs(item.get('weight', 0))
+
+                        explanation_data['list_of_contributions'] = [
+                            {"feature": feat, "weight": w, "value": None}
+                            for feat, w in sorted(aggregated_contrib2.items(), key=lambda x: x[1], reverse=True)
+                        ]
 
         return explanation_data
 

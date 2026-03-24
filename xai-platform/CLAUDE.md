@@ -247,6 +247,8 @@ All API endpoints are prefixed with `/api/v1/` except WebSocket and health check
    - SHAP: `compute_shap_values` task
    - LIME: computed synchronously or async depending on config
 
+**Note**: Both SHAP and LIME support **regression** and **classification** tasks. The mode is automatically detected from the model type.
+
 ### Feature Schema Generation
 Critical schema logic in `ModelLoaderService.generate_feature_schema()`:
 - Handles sklearn pipelines with `ColumnTransformer`
@@ -376,7 +378,16 @@ See `backend/.env.production.example` for all available variables. Key ones:
 - **Model Loading**: Models are stored in MinIO and loaded into memory on demand. Large models may cause memory issues. Consider model caching in `ModelLoaderService` (currently not implemented).
 - **Pickle Security**: Only load models from trusted sources. Pickle can execute arbitrary code.
 - **Categorical Features**: The auto-detection of categorical features relies on `OneHotEncoder` in sklearn pipelines. Manual schema override may be needed for custom preprocessing.
+- **Explanation Aggregation**: For pipelines with `OneHotEncoder`, SHAP and LIME automatically aggregate one-hot encoded feature contributions back to the original categorical feature. This ensures explanations display the original input features rather than hundreds of binary columns.
+  - **Important**: The aggregation logic in `backend/app/workers/tasks.py` (SHAP) and `backend/app/services/lime_service.py` (LIME) uses normalized feature names that handle transformer prefixes (e.g., `"cat__name_Audi"` becomes `"name_Audi"`). This ensures correct mapping even with sklearn's ColumnTransformer naming.
+  - After aggregation, the frontend charts will display only the original features (e.g., `name`, `year`, `km_driven`, `fuel`, `seller_type`, `transmission`, `owner` for the car price model).
 - **Celery**: Requires Redis to be running. Worker must import task modules correctly. Database connections are established per-task (see `tasks.py` pattern).
+  - **Starting Workers**: Run `celery -A app.workers.celery_app worker --loglevel=info --pool=solo` from the `backend` directory. Without a running worker, SHAP/LIME explanations will stay in "pending" state indefinitely and graphs will not be generated.
+- **Explanation Generation Flow**:
+  - Local explanations (SHAP/LIME) are triggered via API endpoints and processed asynchronously by Celery workers.
+  - The frontend polls for completion. If a worker is not running or fails, the graphs will not appear.
+  - Always check Celery worker logs for errors if explanations are not generating.
+- **Global SHAP**: Requires a background dataset (CSV) to be uploaded. Without it, global SHAP cannot be computed. Use the "SHAP Summary Bar" and "SHAP Beeswarm" tabs to upload data and generate global explanations.
 - **CORS**: Backend set to `allow_origins=["*"]` - restrict in production.
 - **JWT Secret**: Must be changed from default for production. Store in secure env var.
 - **MinIO**: Bucket `xai-models` auto-created on startup. Ensure MinIO has sufficient storage.

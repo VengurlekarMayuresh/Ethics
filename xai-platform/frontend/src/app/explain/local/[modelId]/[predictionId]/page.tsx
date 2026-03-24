@@ -3,7 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { useParams, useRouter } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { useState, useRef } from 'react';
 import {
   ArrowLeft,
   Loader2,
@@ -11,27 +11,15 @@ import {
   CheckCircle,
   BarChart3,
   Brain,
+  FileText,
+  Upload,
 } from 'lucide-react';
 import Link from 'next/link';
+import FeatureImportanceBar from '@/components/charts/FeatureImportanceBar';
+import SHAPBeeswarm from '@/components/charts/SHAPBeeswarm';
 import SHAPWaterfall from '@/components/charts/SHAPWaterfall';
 import LIMEPlot from '@/components/charts/LIMEPlot';
 import { format } from 'date-fns';
-
-interface Explanation {
-  _id?: string;
-  status?: string;
-  method: 'shap' | 'lime';
-  explanation_type?: 'local' | 'global';
-  shap_values?: number[][];
-  lime_weights?: any[];
-  expected_value?: number;
-  lime_intercept?: number;
-  lime_local_pred?: number;
-  feature_names?: string[];
-  nl_explanation?: string;
-  created_at?: string;
-  error?: string;
-}
 
 interface Prediction {
   _id: string;
@@ -42,13 +30,47 @@ interface Prediction {
   created_at: string;
 }
 
-export default function LocalExplanationPage() {
+interface GlobalExplanation {
+  _id: string;
+  method: 'shap';
+  explanation_type: 'global';
+  shap_values?: number[][];
+  expected_value?: number | number[];
+  feature_names: string[];
+  global_importance?: Array<{ feature: string; importance: number }>;
+  created_at?: string;
+}
+
+interface LocalExplanation {
+  _id?: string;
+  method: 'shap' | 'lime';
+  explanation_type: 'local';
+  shap_values?: number[][];
+  expected_value?: number;
+  feature_names?: string[];
+  lime_weights?: any[];
+  lime_intercept?: number;
+  lime_local_pred?: number;
+  created_at?: string;
+  status?: 'pending' | 'complete' | 'failed';
+  error?: string;
+}
+
+type TabId = 'shap-bar' | 'shap-beeswarm' | 'shap-force' | 'lime';
+
+export default function UnifiedExplanationPage() {
   const params = useParams();
   const router = useRouter();
   const queryClient = useQueryClient();
 
   const modelId = params.modelId as string;
   const predictionId = params.predictionId as string;
+
+  const [activeTab, setActiveTab] = useState<TabId>('shap-force');
+
+  // For global SHAP upload
+  const [globalShapBackgroundFile, setGlobalShapBackgroundFile] = useState<File | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Fetch prediction
   const {
@@ -64,71 +86,190 @@ export default function LocalExplanationPage() {
     enabled: !!predictionId,
   });
 
-  // Fetch explanation for this prediction
+  // Fetch global SHAP explanation
   const {
-    data: explanation,
-    isLoading: explanationLoading,
-    error: explanationError,
-    refetch: refetchExplanation,
-  } = useQuery<Explanation>({
-    queryKey: ['explanation', predictionId],
+    data: globalShap,
+    isLoading: globalShapLoading,
+    error: globalShapError,
+    refetch: refetchGlobalShap,
+  } = useQuery<GlobalExplanation>({
+    queryKey: ['globalExplanation', modelId],
     queryFn: async () => {
-      const { data } = await api.get(`/explain/prediction/${predictionId}`);
-      return data;
+      try {
+        const { data } = await api.get(`/explain/global/${modelId}/latest`);
+        return data;
+      } catch (error: any) {
+        if (error.response?.status === 404) {
+          // No global SHAP yet – treat as not-found, not an error
+          return null;
+        }
+        throw error;
+      }
     },
-    enabled: !!predictionId,
-    retry: false, // Don't retry on 404 (no explanation yet)
-    refetchInterval: (query) => {
-      // Poll every 3 seconds if status is pending
-      return query.state.data?.status === 'pending' ? 3000 : false;
-    },
+    enabled: !!modelId && (activeTab === 'shap-bar' || activeTab === 'shap-beeswarm'),
+    retry: false,
   });
 
-  // Request explanation mutation
-  const requestExplanation = useMutation({
-    mutationFn: async (method: 'shap' | 'lime') => {
-      const endpoint = method === 'shap' ? `/explain/local/${modelId}` : `/explain/lime/${modelId}`;
-      const { data } = await api.post(endpoint, null, {
+  // Fetch local SHAP explanation
+  const {
+    data: localShap,
+    isLoading: localShapLoading,
+    error: localShapError,
+    refetch: refetchLocalShap,
+  } = useQuery<LocalExplanation>({
+    queryKey: ['localExplanation', predictionId, 'shap'],
+    queryFn: async () => {
+      try {
+        const { data } = await api.get(`/explain/prediction/${predictionId}?method=shap`);
+        return data;
+      } catch (error: any) {
+        if (error.response?.status === 404) {
+          return null;
+        }
+        throw error;
+      }
+    },
+    enabled: !!predictionId && activeTab === 'shap-force',
+    retry: false,
+  });
+
+  // Fetch local LIME explanation
+  const {
+    data: localLime,
+    isLoading: localLimeLoading,
+    error: localLimeError,
+    refetch: refetchLocalLime,
+  } = useQuery<LocalExplanation>({
+    queryKey: ['localExplanation', predictionId, 'lime'],
+    queryFn: async () => {
+      try {
+        const { data } = await api.get(`/explain/prediction/${predictionId}?method=lime`);
+        return data;
+      } catch (error: any) {
+        if (error.response?.status === 404) {
+          return null;
+        }
+        throw error;
+      }
+    },
+    enabled: !!predictionId && activeTab === 'lime',
+    retry: false,
+  });
+
+  // Mutations to request explanations
+  const requestShapMutation = useMutation({
+    mutationFn: async () => {
+      const { data } = await api.post(`/explain/local/${modelId}`, null, {
         params: { prediction_id: predictionId },
       });
-      return { ...data, method };
+      return data;
     },
-    onSuccess: (data) => {
-      // Poll for explanation after a delay
+    onSuccess: () => {
       setTimeout(() => {
-        refetchExplanation();
+        refetchLocalShap();
       }, 2000);
     },
   });
 
-  const handleRequestExplanation = (method: 'shap' | 'lime') => {
-    requestExplanation.mutate(method);
+  const requestLimeMutation = useMutation({
+    mutationFn: async () => {
+      const { data } = await api.post(`/explain/lime/${modelId}`, null, {
+        params: { prediction_id: predictionId },
+      });
+      return data;
+    },
+    onSuccess: () => {
+      setTimeout(() => {
+        refetchLocalLime();
+      }, 2000);
+    },
+  });
+
+  const requestGlobalShapMutation = useMutation({
+    mutationFn: async () => {
+      if (!globalShapBackgroundFile) {
+        throw new Error('Background data file is required');
+      }
+      const formData = new FormData();
+      formData.append('background_data', globalShapBackgroundFile);
+      const { data } = await api.post(`/explain/global/${modelId}`, formData);
+      return data;
+    },
+    onSuccess: () => {
+      // Refetch global SHAP after a delay
+      setTimeout(() => {
+        refetchGlobalShap();
+      }, 3000);
+    },
+  });
+
+  const handleGenerateShap = () => {
+    requestShapMutation.mutate();
   };
 
-  // Check if explanation exists
-  const hasShap = explanation?.method === 'shap';
-  const hasLime = explanation?.method === 'lime';
+  const handleGenerateLime = () => {
+    requestLimeMutation.mutate();
+  };
 
-  // Prepare SHAP data
-  const shapData = hasShap ? {
-    shapValues: explanation.shap_values?.[0] || [], // For single prediction, first row
-    baseValue: explanation.expected_value || 0,
-    prediction: typeof prediction?.prediction === 'number' ? prediction.prediction : 0,
-    featureNames: explanation.feature_names || [],
-  } : null;
+  const handleGenerateGlobalShap = () => {
+    requestGlobalShapMutation.mutate();
+  };
 
-  // Prepare LIME data
-  const limeData = hasLime ? {
-    weights: explanation.lime_weights || [],
-    intercept: explanation.lime_intercept,
-    localPred: explanation.lime_local_pred,
-    featureNames: explanation.feature_names || [],
-  } : null;
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      setGlobalShapBackgroundFile(e.target.files[0]);
+    }
+  };
 
-  // Determine what to show
-  const isPending = explanation?.status === 'pending' || requestExplanation.isPending;
-  const isFailed = explanation?.status === 'failed';
-  const isLoading = predictionLoading || explanationLoading || isPending;
+  const tabs = [
+    { id: 'shap-bar' as TabId, label: 'SHAP Summary Bar', icon: BarChart3 },
+    { id: 'shap-beeswarm' as TabId, label: 'SHAP Beeswarm', icon: BarChart3 },
+    { id: 'shap-force' as TabId, label: 'SHAP Force', icon: BarChart3 },
+    { id: 'lime' as TabId, label: 'LIME', icon: Brain },
+  ];
+
+  const isTabLoading = (tab: TabId) => {
+    switch (tab) {
+      case 'shap-bar':
+      case 'shap-beeswarm':
+        return globalShapLoading;
+      case 'shap-force':
+        return localShapLoading || localShap?.status === 'pending';
+      case 'lime':
+        return localLimeLoading || localLime?.status === 'pending';
+      default:
+        return false;
+    }
+  };
+
+  const getTabData = (tab: TabId) => {
+    switch (tab) {
+      case 'shap-bar':
+      case 'shap-beeswarm':
+        return globalShap;
+      case 'shap-force':
+        return localShap;
+      case 'lime':
+        return localLime;
+    }
+  };
+
+  const getTabError = (tab: TabId) => {
+    switch (tab) {
+      case 'shap-bar':
+      case 'shap-beeswarm':
+        return globalShapError;
+      case 'shap-force':
+        return localShapError;
+      case 'lime':
+        return localLimeError;
+      default:
+        return null;
+    }
+  };
+
+  const isGeneratingGlobal = requestGlobalShapMutation.isPending;
+  const globalShapHasData = globalShap && (globalShap.global_importance?.length > 0 || globalShap.shap_values?.length > 0);
 
   if (predictionLoading) {
     return (
@@ -164,44 +305,11 @@ export default function LocalExplanationPage() {
             <ArrowLeft className="h-5 w-5 text-gray-600" />
           </Link>
           <div>
-            <h1 className="text-2xl font-bold text-gray-900">Explanation</h1>
+            <h1 className="text-2xl font-bold text-gray-900">Explanation Dashboard</h1>
             <p className="mt-1 text-sm text-gray-500">
               Model: {modelId.slice(0, 8)}... | Prediction: {predictionId.slice(0, 8)}...
             </p>
           </div>
-        </div>
-
-        {/* Tabs for SHAP/LIME */}
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => handleRequestExplanation('shap')}
-            disabled={requestExplanation.isPending}
-            className={`inline-flex items-center rounded-lg px-4 py-2 text-sm font-medium transition ${
-              hasShap && !hasLime
-                ? 'bg-indigo-600 text-white'
-                : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'
-            }`}
-          >
-            <BarChart3 className="mr-2 h-4 w-4" />
-            SHAP
-            {!hasShap && !hasLime && requestExplanation.isPending && (
-              <Loader2 className="ml-2 h-4 w-4 animate-spin" />
-            )}
-            {hasShap && <CheckCircle className="ml-2 h-4 w-4" />}
-          </button>
-          <button
-            onClick={() => handleRequestExplanation('lime')}
-            disabled={requestExplanation.isPending}
-            className={`inline-flex items-center rounded-lg px-4 py-2 text-sm font-medium transition ${
-              hasLime && !hasShap
-                ? 'bg-purple-600 text-white'
-                : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'
-            }`}
-          >
-            <Brain className="mr-2 h-4 w-4" />
-            LIME
-            {hasLime && <CheckCircle className="ml-2 h-4 w-4" />}
-          </button>
         </div>
       </div>
 
@@ -241,94 +349,312 @@ export default function LocalExplanationPage() {
         </div>
       </div>
 
-      {/* Explanation content */}
-      {(isLoading || explanationError || isFailed) && (
-        <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-8 text-center">
-          {isPending ? (
-            <>
-              <Loader2 className="mx-auto h-10 w-10 animate-spin text-yellow-500" />
-              <h3 className="mt-4 text-lg font-semibold text-yellow-800">
-                Computing explanation...
-              </h3>
-              <p className="mt-2 text-yellow-700">
-                This may take a few moments depending on model complexity.
-              </p>
-            </>
-          ) : (explanationError || isFailed) ? (
-            <>
-              <AlertCircle className="mx-auto h-10 w-10 text-red-400" />
-              <h3 className="mt-4 text-lg font-semibold text-red-800">Explanation error</h3>
-              <p className="mt-2 text-red-700">
-                {explanation?.error || explanationError?.response?.data?.detail || 'Failed to compute explanation.'}
-              </p>
-            </>
-          ) : !explanation ? (
-            <>
-              <Brain className="mx-auto h-10 w-10 text-gray-400" />
-              <h3 className="mt-4 text-lg font-semibold text-gray-900">No explanation yet</h3>
-              <p className="mt-2 text-gray-600">
-                Click SHAP or LIME button above to generate an explanation for this prediction.
-              </p>
-            </>
-          ) : null}
-        </div>
-      )}
+      {/* Tabs */}
+      <div className="border-b border-gray-200">
+        <nav className="flex space-x-0.5 overflow-x-auto" aria-label="Tabs">
+          {tabs.map((tab) => {
+            const isActive = activeTab === tab.id;
+            const isLoading = isTabLoading(tab.id);
+            const Icon = tab.icon;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`group relative min-w-fit py-4 px-6 border-b-2 font-medium text-sm transition-colors ${
+                  isActive
+                    ? 'border-indigo-600 text-indigo-600'
+                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <Icon className="h-4 w-4" />
+                  <span>{tab.label}</span>
+                  {isLoading && <Loader2 className="h-4 w-4 animate-spin" />}
+                  {!isLoading && isActive && <CheckCircle className="h-4 w-4" />}
+                </div>
+              </button>
+            );
+          })}
+        </nav>
+      </div>
 
-      {explanation && explanation.status !== 'pending' && (
-        <div className="space-y-6">
-          {/* Natural language explanation */}
-          {explanation.nl_explanation && (
-            <div className="rounded-lg border border-blue-200 bg-blue-50 p-6">
-              <h3 className="text-lg font-semibold text-blue-900 mb-2">Plain English Explanation</h3>
-              <p className="text-blue-800 leading-relaxed">{explanation.nl_explanation}</p>
-              <p className="text-xs text-blue-600 mt-2">
-                Generated by AI • May require review for accuracy
-              </p>
-            </div>
-          )}
+      {/* Tab content */}
+      <div className="min-h-[400px]">
+        {tabs.map((tab) => {
+          const isActive = activeTab === tab.id;
+          const isLoading = isTabLoading(tab.id);
+          const data = getTabData(tab.id);
+          const error = getTabError(tab.id);
 
-          {/* Charts */}
-          {hasShap && shapData && (
-            <SHAPWaterfall
-              shapValues={shapData.shapValues.map((value, idx) => ({
-                feature: shapData.featureNames[idx] || `Feature ${idx}`,
-                value,
-              }))}
-              baseValue={shapData.baseValue}
-              prediction={shapData.prediction}
-              title="SHAP Waterfall Plot"
-              height={500}
-            />
-          )}
+          if (!isActive) return null;
 
-          {hasLime && limeData && (
-            <LIMEPlot
-              data={limeData.weights}
-              intercept={limeData.intercept}
-              localPred={limeData.localPred}
-              title="LIME Feature Contributions"
-              height={400}
-            />
-          )}
-
-          {/* Explanation metadata */}
-          <div className="rounded-lg border border-gray-200 bg-white p-4">
-            <div className="flex items-center justify-between text-sm text-gray-600">
-              <div>
-                <span className="font-medium">Method:</span>{' '}
-                <span className="capitalize">{explanation.method}</span>
+          // Loading state
+          if (isLoading) {
+            return (
+              <div className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
+                <div className="text-center">
+                  <Loader2 className="mx-auto h-10 w-10 animate-spin text-indigo-600" />
+                  <h3 className="mt-4 text-lg font-semibold text-gray-900">Loading...</h3>
+                  <p className="mt-2 text-gray-600">Please wait while we load the explanation.</p>
+                </div>
               </div>
-              <div>
-                <span className="font-medium">Generated:</span>{' '}
-                {explanation.created_at ? format(new Date(explanation.created_at), 'MMM d, yyyy HH:mm') : 'N/A'}
+            );
+          }
+
+          // Error state (non-404 errors)
+          if (error && error.response?.status !== 404) {
+            return (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-8 text-center">
+                <AlertCircle className="mx-auto h-12 w-12 text-red-400" />
+                <h3 className="mt-4 text-lg font-semibold text-red-800">Failed to load explanation</h3>
+                <p className="mt-2 text-red-700">
+                  {(error as any)?.response?.data?.detail || 'An error occurred.'}
+                </p>
+                <button
+                  onClick={() => window.location.reload()}
+                  className="mt-4 inline-flex items-center px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700"
+                >
+                  Retry
+                </button>
               </div>
-              <div className="text-xs text-gray-500">
-                ID: {explanation._id?.slice(0, 8) || 'N/A'}...
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+            );
+          }
+
+          // Tab specific content
+          switch (tab.id) {
+            case 'shap-bar':
+              if (!globalShapHasData) {
+                return (
+                  <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+                    <BarChart3 className="mx-auto h-16 w-16 text-gray-400" />
+                    <h3 className="mt-4 text-xl font-semibold text-gray-900">SHAP Summary Bar Plot</h3>
+                    <p className="mt-2 text-gray-600 max-w-lg mx-auto">
+                      This chart shows global feature importance based on SHAP values. Upload a background dataset to generate it.
+                    </p>
+                    <div className="mt-6">
+                      <input
+                        type="file"
+                        accept=".csv"
+                        onChange={handleFileChange}
+                        className="hidden"
+                        ref={fileInputRef}
+                        disabled={isGeneratingGlobal}
+                      />
+                      <button
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={isGeneratingGlobal}
+                        className="inline-flex items-center px-6 py-3 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+                      >
+                        <Upload className="mr-2 h-5 w-5" />
+                        {globalShapBackgroundFile ? globalShapBackgroundFile.name : 'Choose CSV file'}
+                      </button>
+                      {globalShapBackgroundFile && (
+                        <button
+                          onClick={handleGenerateGlobalShap}
+                          disabled={isGeneratingGlobal}
+                          className="ml-4 inline-flex items-center px-6 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+                        >
+                          {isGeneratingGlobal ? (
+                            <>
+                              <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                              Computing...
+                            </>
+                          ) : (
+                            'Compute SHAP'
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              }
+              if (globalShap && globalShap.global_importance) {
+                return (
+                  <FeatureImportanceBar
+                    data={globalShap.global_importance}
+                    title="SHAP Feature Importance (Global)"
+                    height={400}
+                    color="#3b82f6"
+                  />
+                );
+              }
+              return null;
+
+            case 'shap-beeswarm':
+              if (!globalShapHasData) {
+                return (
+                  <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+                    <BarChart3 className="mx-auto h-16 w-16 text-gray-400" />
+                    <h3 className="mt-4 text-xl font-semibold text-gray-900">SHAP Beeswarm Plot</h3>
+                    <p className="mt-2 text-gray-600 max-w-lg mx-auto">
+                      This plot shows the distribution of SHAP values across all features. Upload a background dataset to generate it.
+                    </p>
+                    <div className="mt-6">
+                      <input
+                        type="file"
+                        accept=".csv"
+                        onChange={handleFileChange}
+                        className="hidden"
+                        ref={fileInputRef}
+                        disabled={isGeneratingGlobal}
+                      />
+                      <button
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={isGeneratingGlobal}
+                        className="inline-flex items-center px-6 py-3 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+                      >
+                        <Upload className="mr-2 h-5 w-5" />
+                        {globalShapBackgroundFile ? globalShapBackgroundFile.name : 'Choose CSV file'}
+                      </button>
+                      {globalShapBackgroundFile && (
+                        <button
+                          onClick={handleGenerateGlobalShap}
+                          disabled={isGeneratingGlobal}
+                          className="ml-4 inline-flex items-center px-6 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+                        >
+                          {isGeneratingGlobal ? (
+                            <>
+                              <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                              Computing...
+                            </>
+                          ) : (
+                            'Compute SHAP'
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              }
+              if (globalShap && globalShap.shap_values && globalShap.feature_names) {
+                return (
+                  <SHAPBeeswarm
+                    shapValues={globalShap.shap_values}
+                    featureNames={globalShap.feature_names}
+                    title="SHAP Beeswarm Plot (Global Distribution)"
+                    height={500}
+                  />
+                );
+              }
+              return null;
+
+            case 'shap-force':
+              if (!localShap || !localShap.shap_values) {
+                if (localShap?.status === 'pending' || localShapLoading) {
+                  return (
+                    <div className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
+                      <div className="text-center">
+                        <Loader2 className="mx-auto h-10 w-10 animate-spin text-yellow-500" />
+                        <h3 className="mt-4 text-lg font-semibold text-yellow-800">Computing SHAP...</h3>
+                        <p className="mt-2 text-yellow-700">This may take a few moments.</p>
+                      </div>
+                    </div>
+                  );
+                }
+                return (
+                  <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+                    <BarChart3 className="mx-auto h-16 w-16 text-gray-400" />
+                    <h3 className="mt-4 text-xl font-semibold text-gray-900">SHAP Force Plot</h3>
+                    <p className="mt-2 text-gray-600 max-w-lg mx-auto">
+                      This waterfall plot shows how each feature contributed to push the prediction from the base value to the final result.
+                    </p>
+                    <div className="mt-6">
+                      <button
+                        onClick={handleGenerateShap}
+                        disabled={requestShapMutation.isPending}
+                        className="inline-flex items-center px-6 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+                      >
+                        {requestShapMutation.isPending ? (
+                          <>
+                            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                            Generating...
+                          </>
+                        ) : (
+                          'Generate SHAP Explanation'
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
+
+              const baseValue = localShap.expected_value ?? 0;
+              const predValue = typeof prediction.prediction === 'number' ? prediction.prediction : 0;
+              const shapValuesArray = Array.isArray(localShap.shap_values) ? localShap.shap_values : [];
+              const firstRow = shapValuesArray[0] || [];
+              const featureNames = localShap.feature_names || [];
+
+              const shapValuesFormatted = firstRow.map((val, idx) => ({
+                feature: featureNames[idx] || `Feature ${idx}`,
+                value: val,
+              }));
+
+              return (
+                <SHAPWaterfall
+                  shapValues={shapValuesFormatted}
+                  baseValue={baseValue}
+                  prediction={predValue}
+                  title="SHAP Force Plot (Local Explanation)"
+                  height={500}
+                />
+              );
+
+            case 'lime':
+              if (!localLime || !localLime.lime_weights) {
+                if (localLime?.status === 'pending' || localLimeLoading) {
+                  return (
+                    <div className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
+                      <div className="text-center">
+                        <Loader2 className="mx-auto h-10 w-10 animate-spin text-purple-500" />
+                        <h3 className="mt-4 text-lg font-semibold text-purple-800">Computing LIME...</h3>
+                        <p className="mt-2 text-purple-700">This may take a few moments.</p>
+                      </div>
+                    </div>
+                  );
+                }
+                return (
+                  <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+                    <Brain className="mx-auto h-16 w-16 text-gray-400" />
+                    <h3 className="mt-4 text-xl font-semibold text-gray-900">LIME Local Explanation</h3>
+                    <p className="mt-2 text-gray-600 max-w-lg mx-auto">
+                      LIME explains the prediction by approximating the model locally with an interpretable model.
+                    </p>
+                    <div className="mt-6">
+                      <button
+                        onClick={handleGenerateLime}
+                        disabled={requestLimeMutation.isPending}
+                        className="inline-flex items-center px-6 py-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50"
+                      >
+                        {requestLimeMutation.isPending ? (
+                          <>
+                            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                            Generating...
+                          </>
+                        ) : (
+                          'Generate LIME Explanation'
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
+
+              const limeWeights = localLime.lime_weights || [];
+              return (
+                <LIMEPlot
+                  data={limeWeights}
+                  intercept={localLime.lime_intercept}
+                  localPred={localLime.lime_local_pred}
+                  title="LIME Feature Contributions"
+                  height={400}
+                />
+              );
+
+            default:
+              return null;
+          }
+        })}
+      </div>
     </div>
   );
 }

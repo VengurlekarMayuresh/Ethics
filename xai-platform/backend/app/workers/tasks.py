@@ -645,6 +645,89 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                 shap_values = explainer.shap_values(input_data.values)
                 expected_value = explainer.expected_value
 
+        # ------------------------------------------------------------
+        # AGGREGATION: For pipelines with OneHotEncoder, combine one-hot
+        # encoded features back to original categorical features.
+        # The frontend expects a manageable number of features (original inputs),
+        # not hundreds of one-hot encoded columns.
+        # ------------------------------------------------------------
+        if isinstance(model_obj, Pipeline):
+            preprocessor = None
+            for step_name, step_obj in model_obj.steps:
+                if hasattr(step_obj, 'transform'):
+                    preprocessor = step_obj
+                    break
+
+            if preprocessor and hasattr(preprocessor, 'get_feature_names_out'):
+                # We have a preprocessor that expanded features (e.g., OneHotEncoder)
+                # Build mapping from original feature to encoded column indices
+                from collections import defaultdict
+                original_to_encoded = defaultdict(list)
+                original_feature_names_set = set()
+
+                if hasattr(preprocessor, 'transformers_'):
+                    for transformer_name, transformer_obj, cols in preprocessor.transformers_:
+                        transformer_class = transformer_obj.__class__.__name__
+
+                        for col in cols:
+                            original_feature_names_set.add(col)
+                            # Find all encoded columns that belong to this original column
+                            for idx, fname in enumerate(final_feature_names):
+                                if isinstance(fname, bytes):
+                                    fname = fname.decode('utf-8')
+                                fname_str = str(fname)
+                                # Normalize: remove transformer prefix if present (e.g., "cat__name_X" -> "name_X")
+                                if '__' in fname_str:
+                                    parts = fname_str.split('__', 1)
+                                    norm_name = parts[1] if len(parts) == 2 else fname_str
+                                else:
+                                    norm_name = fname_str
+                                # Match: exact match for numeric, or starts with "col_" for one-hot
+                                if norm_name == col or norm_name.startswith(col + '_'):
+                                    original_to_encoded[col].append(idx)
+
+                # If we found any grouping, aggregate
+                if original_to_encoded:
+                    n_samples = shap_values.shape[0] if hasattr(shap_values, 'shape') else len(shap_values)
+                    # Ensure shap_values is 2D
+                    if isinstance(shap_values, list):
+                        # For classification, we take the class 1 (positive) for binary, or first class
+                        # Convert to 2D array
+                        if len(shap_values) > 0:
+                            # shap_values[i] is for class i
+                            # We'll aggregate for class 1 if binary and 2 classes, else class 0
+                            if len(shap_values) == 2:
+                                class_idx = 1
+                            else:
+                                class_idx = 0
+                            shap_arr = np.asarray(shap_values[class_idx])
+                            if shap_arr.ndim == 1:
+                                shap_arr = shap_arr.reshape(1, -1)
+                        else:
+                            shap_arr = np.array([])
+                    else:
+                        shap_arr = np.asarray(shap_values)
+                        if shap_arr.ndim == 1:
+                            shap_arr = shap_arr.reshape(1, -1)
+
+                    if shap_arr.ndim == 2 and shap_arr.shape[0] > 0:
+                        # Create aggregated array
+                        orig_features_list = sorted(original_feature_names_set)
+                        aggregated_shap = np.zeros((shap_arr.shape[0], len(orig_features_list)), dtype=float)
+
+                        for agg_idx, orig_feat in enumerate(orig_features_list):
+                            encoded_indices = original_to_encoded.get(orig_feat, [])
+                            if len(encoded_indices) == 1:
+                                aggregated_shap[:, agg_idx] = shap_arr[:, encoded_indices[0]]
+                            elif len(encoded_indices) > 1:
+                                # Sum contributions from all encoded columns
+                                aggregated_shap[:, agg_idx] = shap_arr[:, encoded_indices].sum(axis=1)
+                            # else: feature not found (shouldn't happen) - leave as 0
+
+                        shap_values = aggregated_shap
+                        final_feature_names = orig_features_list
+                    # else: shap_values is empty or malformed, leave as-is
+
         return shap_values, expected_value, final_feature_names
 
     except Exception as e:
