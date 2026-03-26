@@ -318,14 +318,72 @@ See `backend/.env.production.example` for all available variables. Key ones:
 
 - `backend/app/main.py` - FastAPI application entry point, all routes registered here
 - `backend/app/config.py` - Application configuration
-- `backend/app/services/model_loader_service.py` - Core model loading logic (supports multiple frameworks)
-- `backend/app/workers/tasks.py` - Celery background tasks (SHAP, etc.)
+- `backend/app/services/model_loader_service.py` - Core model loading logic (supports multiple frameworks) + model type detection
+- `backend/app/workers/tasks.py` - Celery background tasks (SHAP, LIME) with TreeExplainer optimization
 - `backend/fix_feature_schemas.py` - Utility to fix categorical feature schema bugs
 - `backend/FIX_SCHEMA_README.md` - Documentation for the schema fix script
 - `frontend/src/app/` - Next.js app router pages
 - `frontend/src/components/charts/` - Visualization components for SHAP/LIME
 - `docker-compose.yml` - Development orchestration
 - `docker-compose.prod.yml` - Production orchestration (includes nginx)
+
+## Recent Improvements (2025-03-26)
+
+### SHAP Performance Optimization
+- **Problem**: Global SHAP for pipeline models was using slow KernelExplainer, taking hours on large datasets.
+- **Solution**: Modified `backend/app/workers/tasks.py`:
+  - Pipeline models now try `TreeExplainer` first (dramatically faster for tree-based models)
+  - Fallback to `KernelExplainer` with capped background samples (200) for non-tree models
+  - Global SHAP now processes full dataset efficiently (no unnecessary sampling)
+- **Impact**: Graph generation now completes in seconds/minutes instead of hours.
+
+### Automatic Model Detection
+- **Added**: `ModelLoaderService.get_estimator_info()` in `backend/app/services/model_loader_service.py`
+  - Detects specific algorithm: `RandomForestRegressor`, `XGBRegressor`, `LinearRegression`, etc.
+  - Determines model family: `tree`, `linear`, `svm`, `neighbors`, `neural_network`, etc.
+  - Sets `is_tree_based` flag for SHAP optimization.
+- **Auto-detection of task_type**: No longer requires manual input; inferred from model (classification vs regression).
+- **Database changes**: Models collection now stores:
+  - `model_type` (e.g., "RandomForestRegressor")
+  - `model_family` (e.g., "tree")
+  - `is_tree_based` (boolean)
+- **Frontend changes**:
+  - Model upload form (`/models/upload`) no longer asks for task type (auto-detected).
+  - Model details page (`/models/[id]`) displays algorithm and model family in the metadata section.
+
+## Recent Improvements (2026-03-26)
+
+### Global LIME Support
+- Added full support for global LIME explanations.
+- New endpoints:
+  - `POST /api/v1/explain/lime/global/{model_id}` - request global LIME with background dataset
+  - `GET /api/v1/explain/lime/global/{model_id}/latest` - retrieve latest global LIME
+- Global LIME aggregates local LIME explanations across multiple samples to produce feature importance.
+- Frontend global explanation page includes LIME as an alternative method via method selector.
+
+### Enhanced Global SHAP
+- **Classification handling**: Properly handles 3D SHAP output (samples × features × classes) by detecting class axis and selecting positive class (binary) or averaging (multi-class).
+- **OneHotEncoder aggregation**: For pipeline models with one-hot encoded categorical features, SHAP values are aggregated back to the original categorical features, ensuring manageable feature counts and interpretable results.
+- **Feature name consistency**: SHAP now uses feature names from `_compute_shap` (post-aggregation) for `global_importance` and `feature_names` fields.
+
+### Pipeline Preprocessing Fixes (Both SHAP & LIME)
+- Both SHAP and LIME tasks now correctly preprocess input data when models use sklearn pipelines with ColumnTransformer.
+- Feature names are extracted from the preprocessor's `get_feature_names_out()` when available, ensuring consistency between explainer and feature importance display.
+- Local SHAP (`compute_shap_values`) and local LIME (`compute_lime_values`) also updated to use correct feature names after aggregation.
+
+### Bug Fix: SHAP Global Endpoint Filter
+- Fixed `GET /api/v1/explain/global/{model_id}/latest` to filter by `method: "shap"` in addition to `explanation_type: "global"`.
+- Previously, this endpoint returned the latest global explanation regardless of method, causing SHAP tab to display LIME data if that was computed last. This made SHAP appear broken.
+- The filter ensures each method's latest endpoint returns only explanations of that method.
+
+### Performance Optimizations
+- Global SHAP for tree-based pipelines now tries `TreeExplainer` first, falling back to `KernelExplainer` with a background sample cap (200) for non-tree models.
+- Global LIME limits explanation to 50 background samples to keep computation time reasonable.
+
+### Frontend Improvements
+- Global explanation page (`/explain/global/[modelId]`) now allows switching between SHAP and LIME without page reload.
+- SHAP Beeswarm plot now properly displays global SHAP values for all samples.
+- Dependence plots can be generated by uploading a background dataset and selecting a feature.
 
 ## Data Flow
 

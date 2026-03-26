@@ -235,7 +235,7 @@ async def get_global_explanation(
 
         # Find latest global explanation for this model
         explanation = await db.explanations.find_one(
-            {"model_id": model_id, "explanation_type": "global"},
+            {"model_id": model_id, "explanation_type": "global", "method": "shap"},
             sort=[("created_at", -1)]
         )
 
@@ -416,7 +416,7 @@ async def request_global_lime(
         # Upload background data
         contents = await background_data.read()
         bg_object_name = f"{current_user['_id']}/lime_bg_{int(datetime.utcnow().timestamp())}_{background_data.filename}"
-        storage.upload_file(contents, bg_object_name)
+        await storage.upload_file(contents, bg_object_name)
 
         # Trigger async global LIME computation
         task = celery_app.send_task("compute_global_lime", args=[model_id, bg_object_name, num_features])

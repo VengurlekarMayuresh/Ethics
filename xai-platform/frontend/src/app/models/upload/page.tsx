@@ -12,7 +12,6 @@ const modelSchema = z.object({
   name: z.string().min(3, 'Name must be at least 3 characters'),
   description: z.string().optional(),
   framework: z.enum(['sklearn', 'xgboost', 'keras', 'onnx', 'api']),
-  task_type: z.enum(['classification', 'regression']),
   features: z.array(z.object({
     name: z.string().min(1, 'Feature name is required'),
     type: z.enum(['numeric', 'categorical']),
@@ -34,7 +33,6 @@ export default function ModelUpload() {
     resolver: zodResolver(modelSchema),
     defaultValues: {
       framework: 'sklearn',
-      task_type: 'classification',
       features: []  // Empty by default; auto-detection will be used
     }
   });
@@ -90,7 +88,7 @@ export default function ModelUpload() {
       formData.append('name', data.name);
       formData.append('description', data.description || '');
       formData.append('framework', data.framework);
-      formData.append('task_type', data.task_type);
+      // task_type is auto-detected; not sent
       formData.append('feature_schema', JSON.stringify(formattedFeatures));
       formData.append('file', modelFile);
 
@@ -225,14 +223,6 @@ export default function ModelUpload() {
                     <option value="xgboost">XGBoost</option>
                     <option value="keras">Keras (TensorFlow)</option>
                     <option value="onnx">ONNX Runtime</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-700">Task Type</label>
-                  <select {...register('task_type')} className="mt-1 block w-full rounded-md border border-gray-300 py-2 px-3 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 sm:text-sm">
-                    <option value="classification">Classification</option>
-                    <option value="regression">Regression</option>
                   </select>
                 </div>
               </div>

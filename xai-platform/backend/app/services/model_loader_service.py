@@ -165,23 +165,93 @@ class ModelLoaderService:
             return False
 
     @staticmethod
+    def get_estimator_info(model_obj: Any) -> Dict[str, str]:
+        """
+        Extract detailed model/estimator information.
+        Returns model class name, module, and family (e.g., 'tree', 'linear', 'svm').
+        """
+        info = {
+            "estimator_name": None,
+            "estimator_family": None,
+            "is_tree_based": False,
+            "is_linear": False,
+        }
+
+        try:
+            # Get the actual estimator - handle pipelines
+            from sklearn.pipeline import Pipeline
+            if isinstance(model_obj, Pipeline):
+                # For pipelines, get the final estimator
+                estimator = model_obj.steps[-1][1]
+                info["estimator_name"] = estimator.__class__.__name__
+                info["module"] = estimator.__class__.__module__
+            else:
+                info["estimator_name"] = model_obj.__class__.__name__
+                info["module"] = model_obj.__class__.__module__
+
+            # Determine the model family based on estimator name
+            name = info["estimator_name"].lower()
+
+            # Tree-based models
+            if any(keyword in name for keyword in ['randomforest', 'extratree', 'gradientboosting', 'xgb', 'xgboost', 'lgb', 'lightgbm', 'catboost', 'decisiontree', 'tree']):
+                info["estimator_family"] = "tree"
+                info["is_tree_based"] = True
+            # Linear models
+            elif any(keyword in name for keyword in ['linear', 'logistic', 'ridge', 'lasso', 'elastic', 'huber', 'theil', 'perceptron']):
+                info["estimator_family"] = "linear"
+                info["is_linear"] = True
+            # SVM models
+            elif any(keyword in name for keyword in ['svm', 'svc', 'svr', 'nusvc', 'nusvr', 'oneclass', 'linearsvc', 'linearsvr']):
+                info["estimator_family"] = "svm"
+            # KNN models
+            elif any(keyword in name for keyword in ['knn', 'neighbor', 'radius']):
+                info["estimator_family"] = "neighbors"
+            # Neural networks
+            elif any(keyword in name for keyword in ['mlp', 'neural', 'dnn']):
+                info["estimator_family"] = "neural_network"
+            # Naive Bayes
+            elif any(keyword in name for keyword in ['bayes', 'gaussian', 'multinomial', 'bernoulli', ' Complement']):
+                info["estimator_family"] = "naive_bayes"
+            # Clustering (if somehow used as predictor)
+            elif any(keyword in name for keyword in ['kmeans', 'dbscan', 'cluster', 'gmm']):
+                info["estimator_family"] = "clustering"
+            else:
+                info["estimator_family"] = "other"
+
+        except Exception:
+            pass
+
+        return info
+
+    @staticmethod
     async def get_model_info(model_obj: Any, framework: str) -> Dict[str, Any]:
         """
-        Get basic information about the model for metadata.
-        Returns task type (classification/regression) and feature info.
+        Get comprehensive information about the model for metadata.
+        Returns task type (classification/regression), feature info, and estimator details.
         """
-        info = {"task_type": "unknown", "feature_info": {}}
+        info = {
+            "task_type": "unknown",
+            "feature_info": {},
+            "estimator_info": ModelLoaderService.get_estimator_info(model_obj)
+        }
 
         try:
             if framework == "sklearn":
                 from sklearn.base import is_classifier, is_regressor
-                if is_classifier(model_obj):
+                from sklearn.pipeline import Pipeline
+
+                # For pipelines, inspect the final estimator
+                estimator = model_obj
+                if isinstance(model_obj, Pipeline):
+                    estimator = model_obj.steps[-1][1]
+
+                if is_classifier(estimator):
                     info["task_type"] = "classification"
-                    info["classes"] = model_obj.classes_.tolist() if hasattr(model_obj, 'classes_') else None
-                elif is_regressor(model_obj):
+                    info["classes"] = estimator.classes_.tolist() if hasattr(estimator, 'classes_') else None
+                elif is_regressor(estimator):
                     info["task_type"] = "regression"
 
-                # Get feature names if available
+                # Get feature names if available (from the pipeline's first step or the model itself)
                 if hasattr(model_obj, 'feature_names_in'):
                     info["feature_info"] = {
                         "names": model_obj.feature_names_in_.tolist(),
@@ -191,15 +261,26 @@ class ModelLoaderService:
             elif framework == "xgboost":
                 # XGBoost models can be used for classification or regression
                 import xgboost as xgb
-                # Check if it's a classification model by looking at output shape
                 try:
-                    test_data = xgb.DMatrix([[0.5, 0.5]])
-                    prediction = model_obj.predict(test_data)
-                    if len(prediction.shape) > 1 and prediction.shape[1] > 1:
+                    # For sklearn API wrappers (XGBClassifier, XGBRegressor), they have classes_ attribute and objective
+                    if hasattr(model_obj, 'classes_'):
                         info["task_type"] = "classification"
-                        info["classes"] = list(range(prediction.shape[1]))
+                        info["classes"] = model_obj.classes_.tolist()
+                    elif hasattr(model_obj, 'objective'):
+                        obj = model_obj.objective.lower()
+                        if any(keyword in obj for keyword in ['binary', 'multi', 'softmax']):
+                            info["task_type"] = "classification"
+                        else:
+                            info["task_type"] = "regression"
                     else:
-                        info["task_type"] = "regression"
+                        # For native Booster, check output shape from predict
+                        test_data = xgb.DMatrix([[0.5, 0.5]])
+                        prediction = model_obj.predict(test_data)
+                        if len(prediction.shape) > 1 and prediction.shape[1] > 1:
+                            info["task_type"] = "classification"
+                            info["classes"] = list(range(prediction.shape[1]))
+                        else:
+                            info["task_type"] = "regression"
                 except:
                     pass
 

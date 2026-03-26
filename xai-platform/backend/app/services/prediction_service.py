@@ -4,6 +4,7 @@ import json
 import numpy as np
 import pandas as pd
 import onnxruntime
+import xgboost as xgb
 from typing import Any, Dict, List, Union
 from pathlib import Path
 from app.utils.file_handler import storage

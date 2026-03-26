@@ -1,6 +1,7 @@
 import shap
 import numpy as np
 import pandas as pd
+import os
 from typing import Dict, Any, List, Optional
 from app.workers.celery_app import celery_app
 from app.services.model_loader_service import ModelLoaderService
@@ -12,7 +13,72 @@ from bson import ObjectId
 import pickle
 import joblib
 from sklearn.pipeline import Pipeline
+
+# Maximum number of background samples to use for global SHAP/LIME explanations
+# Prevents extremely long computation times with large datasets
+MAX_GLOBAL_SHAP_SAMPLES = int(os.getenv("MAX_GLOBAL_SHAP_SAMPLES", "200"))
 import re
+
+def _align_background_data(background_df: pd.DataFrame, model_doc: dict) -> pd.DataFrame:
+    """
+    Align background dataset to match the model's expected feature schema.
+    - Renames columns to match expected feature names (case-insensitive, normalized)
+    - Drops extra columns not in schema
+    - Ensures all expected features are present
+    - Reorders columns to match feature schema order
+    - Validates no missing values
+    Returns aligned DataFrame.
+    """
+    feature_schema = model_doc.get('feature_schema', [])
+    if not feature_schema:
+        raise ValueError("Model does not have a feature schema defined. Cannot align background data.")
+
+    expected_features = [fs['name'] for fs in feature_schema]
+
+    # Normalization function for fuzzy matching
+    def normalize(name):
+        return re.sub(r'[^a-z0-9]', '', str(name).strip().lower())
+
+    # Build mapping from normalized background column names to actual names
+    bg_norm_to_actual = {}
+    for col in background_df.columns:
+        norm = normalize(col)
+        if norm not in bg_norm_to_actual:
+            bg_norm_to_actual[norm] = col
+
+    # Map each expected feature to a background column
+    column_mapping = {}
+    for exp_feat in expected_features:
+        # Exact match
+        if exp_feat in background_df.columns:
+            column_mapping[exp_feat] = exp_feat
+            continue
+        # Normalized match
+        norm_exp = normalize(exp_feat)
+        if norm_exp in bg_norm_to_actual:
+            column_mapping[exp_feat] = bg_norm_to_actual[norm_exp]
+            continue
+        # Not found
+        raise ValueError(
+            f"Background data missing required feature: '{exp_feat}'. "
+            f"Available columns: {list(background_df.columns)}"
+        )
+
+    # Build aligned DataFrame with only expected features, in expected order
+    aligned = pd.DataFrame()
+    for exp_feat in expected_features:
+        actual_col = column_mapping[exp_feat]
+        aligned[exp_feat] = background_df[actual_col].copy()
+
+    # Check for missing values
+    if aligned.isna().any().any():
+        nan_cols = aligned.columns[aligned.isna().any()].tolist()
+        raise ValueError(
+            f"Background data contains missing values in columns: {nan_cols}. "
+            "Please impute or remove rows with missing values before uploading."
+        )
+
+    return aligned
 
 @celery_app.task(bind=True, name="compute_shap_values")
 def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, Any]:
@@ -397,6 +463,10 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
             bg_bytes = await storage.download_file(background_data_path)
             background_df = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
 
+            # Sample background data to avoid extremely long computation
+            if len(background_df) > MAX_GLOBAL_SHAP_SAMPLES:
+                background_df = background_df.sample(n=MAX_GLOBAL_SHAP_SAMPLES, random_state=42)
+
             self.update_state(state="PROGRESS", meta={"status": "creating LIME explainer", "progress": 50})
 
             # Determine mode
@@ -540,16 +610,8 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
         # Check if model is a sklearn Pipeline
         if isinstance(model_obj, Pipeline):
             # For pipelines, we need to work in the preprocessed feature space
-            # because the model expects numeric inputs after preprocessing
+            # because the model expects numeric inputs after preprocessing.
 
-            # Prepare background data (raw)
-            if background_data is not None and len(background_data) > 0:
-                bg_raw = background_data if len(background_data) <= 100 else background_data.iloc[:100]
-                bg = _prepare_background(bg_raw)
-            else:
-                bg = _prepare_background(input_data)
-
-            # IMPORTANT: Preprocess the background data to numeric space
             # Find the preprocessing step in the pipeline
             preprocessor = None
             for step_name, step_obj in model_obj.steps:
@@ -557,64 +619,80 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                     preprocessor = step_obj
                     break
 
-            if preprocessor is not None:
-                # Transform raw background to preprocessed numeric features
-                bg_processed = preprocessor.transform(bg)
-                if hasattr(bg_processed, 'toarray'):  # sparse matrix
-                    bg_processed = bg_processed.toarray()
-                bg_numeric = np.asarray(bg_processed, dtype=float)
-
-                # Try to get feature names from the preprocessor
-                if hasattr(preprocessor, 'get_feature_names_out'):
-                    try:
-                        raw_names = preprocessor.get_feature_names_out()
-                        cleaned_names = []
-                        for name in raw_names:
-                            if isinstance(name, bytes):
-                                name = name.decode('utf-8')
-                            if '__' in name:
-                                name = name.split('__', 1)[1]
-                            cleaned_names.append(name)
-                        final_feature_names = cleaned_names
-                    except Exception:
-                        # Fallback to generic feature names if extraction fails
-                        final_feature_names = [f"feature_{i}" for i in range(bg_numeric.shape[1])]
-                else:
-                    # No get_feature_names_out, use generic names
-                    final_feature_names = [f"feature_{i}" for i in range(bg_numeric.shape[1])]
-            else:
-                # No clear preprocessor, fall back to raw numeric (may fail if strings present)
-                bg_numeric = bg.values.astype(float)
-                # Keep default final_feature_names = expected_columns
-
-            # Get the final estimator for prediction on preprocessed data
+            # Get the final estimator for prediction
             final_estimator = model_obj.steps[-1][1]
 
-            # Predict function works directly on preprocessed numeric data
-            if hasattr(final_estimator, 'predict_proba'):
-                predict_fn = final_estimator.predict_proba
+            # Determine final_feature_names from preprocessor (if available)
+            # This is needed for aggregating one-hot encoded features later.
+            final_feature_names = expected_columns  # default fallback
+            if preprocessor is not None and hasattr(preprocessor, 'get_feature_names_out'):
+                try:
+                    raw_names = preprocessor.get_feature_names_out()
+                    cleaned_names = []
+                    for name in raw_names:
+                        if isinstance(name, bytes):
+                            name = name.decode('utf-8')
+                        if '__' in name:
+                            name = name.split('__', 1)[1]
+                        cleaned_names.append(name)
+                    final_feature_names = cleaned_names
+                except Exception:
+                    pass  # keep default
+
+            # Prepare background data (raw) - align columns, use FULL background if available
+            if background_data is not None and len(background_data) > 0:
+                bg = _prepare_background(background_data)  # use full dataset
             else:
-                predict_fn = final_estimator.predict
+                bg = _prepare_background(input_data)
 
-            def _predict_preprocessed(values):
-                # values is already in preprocessed space (numeric array)
-                return predict_fn(values)
+            # --------------------------------------------------------
+            # Try TreeExplainer first - FAST for tree-based models
+            # --------------------------------------------------------
+            try:
+                # TreeExplainer can work directly with the pipeline and raw background
+                explainer = shap.TreeExplainer(model_obj, bg)
+                shap_values = explainer.shap_values(input_data)
+                expected_value = explainer.expected_value
+            except Exception:
+                # TreeExplainer failed or not supported; fallback to KernelExplainer
+                # For KernelExplainer we must limit background size to avoid freeze
+                if len(bg) > MAX_GLOBAL_SHAP_SAMPLES:
+                    bg_capped = bg.sample(n=MAX_GLOBAL_SHAP_SAMPLES, random_state=42)
+                else:
+                    bg_capped = bg
 
-            # Create SHAP explainer in preprocessed feature space (seed for reproducibility)
-            np.random.seed(42)  # Ensure deterministic sampling
-            explainer = shap.KernelExplainer(_predict_preprocessed, bg_numeric)
+                # Preprocess the capped background to numeric space
+                if preprocessor is not None:
+                    bg_processed = preprocessor.transform(bg_capped)
+                    if hasattr(bg_processed, 'toarray'):  # sparse matrix
+                        bg_processed = bg_processed.toarray()
+                    bg_numeric = np.asarray(bg_processed, dtype=float)
+                else:
+                    bg_numeric = bg_capped.values.astype(float)
 
-            # Also preprocess the input data
-            if preprocessor is not None:
-                input_processed = preprocessor.transform(input_data)
-                if hasattr(input_processed, 'toarray'):
-                    input_processed = input_processed.toarray()
-                input_numeric = np.asarray(input_processed, dtype=float)
-            else:
-                input_numeric = input_data.values.astype(float)
+                # Preprocess input data to numeric space for KernelExplainer
+                if preprocessor is not None:
+                    input_processed = preprocessor.transform(input_data)
+                    if hasattr(input_processed, 'toarray'):
+                        input_processed = input_processed.toarray()
+                    input_numeric = np.asarray(input_processed, dtype=float)
+                else:
+                    input_numeric = input_data.values.astype(float)
 
-            shap_values = explainer.shap_values(input_numeric)
-            expected_value = explainer.expected_value
+                # Predict function for preprocessed data
+                if hasattr(final_estimator, 'predict_proba'):
+                    predict_fn = final_estimator.predict_proba
+                else:
+                    predict_fn = final_estimator.predict
+
+                def _predict_preprocessed(values):
+                    return predict_fn(values)
+
+                # Create KernelExplainer
+                np.random.seed(42)
+                explainer = shap.KernelExplainer(_predict_preprocessed, bg_numeric)
+                shap_values = explainer.shap_values(input_numeric)
+                expected_value = explainer.expected_value
 
         else:
             # For non-pipeline models, try TreeExplainer first for tree-based models
@@ -625,7 +703,7 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
             except Exception:
                 # Fallback to KernelExplainer
                 if background_data is not None and len(background_data) > 0:
-                    bg_raw = background_data if len(background_data) <= 100 else background_data.iloc[:100]
+                    bg_raw = background_data if len(background_data) <= MAX_GLOBAL_SHAP_SAMPLES else background_data.iloc[:MAX_GLOBAL_SHAP_SAMPLES]
                     bg = _prepare_background(bg_raw)
                 else:
                     # Generate synthetic background if none provided

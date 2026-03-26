@@ -3,7 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { useParams, useRouter } from 'next/navigation';
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import {
   ArrowLeft,
   Loader2,
@@ -67,6 +67,7 @@ export default function UnifiedExplanationPage() {
   const predictionId = params.predictionId as string;
 
   const [activeTab, setActiveTab] = useState<TabId>('shap-force');
+  const [autoTriggered, setAutoTriggered] = useState(false);
 
   // For global SHAP upload
   const [globalShapBackgroundFile, setGlobalShapBackgroundFile] = useState<File | null>(null);
@@ -271,6 +272,34 @@ export default function UnifiedExplanationPage() {
   const isGeneratingGlobal = requestGlobalShapMutation.isPending;
   const globalShapHasData = globalShap && (globalShap.global_importance?.length > 0 || globalShap.shap_values?.length > 0);
 
+  // Auto-trigger SHAP and LIME on page load if not already computed
+  useEffect(() => {
+    if (autoTriggered || !predictionId) return;
+
+    // Trigger SHAP if no complete explanation exists
+    const shapComplete = localShap && localShap.shap_values && (!localShap.status || localShap.status === 'complete');
+    if (!shapComplete && !requestShapMutation.isPending) {
+      requestShapMutation.mutate();
+    }
+
+    // Trigger LIME if no complete explanation exists
+    const limeComplete = localLime && localLime.lime_weights && (!localLime.status || localLime.status === 'complete');
+    if (!limeComplete && !requestLimeMutation.isPending) {
+      requestLimeMutation.mutate();
+    }
+
+    setAutoTriggered(true);
+  }, [
+    predictionId,
+    localShap,
+    localLime,
+    requestShapMutation.isPending,
+    requestLimeMutation.isPending,
+    autoTriggered,
+    requestShapMutation,
+    requestLimeMutation,
+  ]);
+
   if (predictionLoading) {
     return (
       <div className="flex h-64 items-center justify-center">
@@ -391,7 +420,7 @@ export default function UnifiedExplanationPage() {
           // Loading state
           if (isLoading) {
             return (
-              <div className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
+              <div key={tab.id} className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
                 <div className="text-center">
                   <Loader2 className="mx-auto h-10 w-10 animate-spin text-indigo-600" />
                   <h3 className="mt-4 text-lg font-semibold text-gray-900">Loading...</h3>
@@ -404,7 +433,7 @@ export default function UnifiedExplanationPage() {
           // Error state (non-404 errors)
           if (error && error.response?.status !== 404) {
             return (
-              <div className="rounded-lg border border-red-200 bg-red-50 p-8 text-center">
+              <div key={tab.id} className="rounded-lg border border-red-200 bg-red-50 p-8 text-center">
                 <AlertCircle className="mx-auto h-12 w-12 text-red-400" />
                 <h3 className="mt-4 text-lg font-semibold text-red-800">Failed to load explanation</h3>
                 <p className="mt-2 text-red-700">
@@ -425,7 +454,7 @@ export default function UnifiedExplanationPage() {
             case 'shap-bar':
               if (!globalShapHasData) {
                 return (
-                  <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+                  <div key={tab.id} className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
                     <BarChart3 className="mx-auto h-16 w-16 text-gray-400" />
                     <h3 className="mt-4 text-xl font-semibold text-gray-900">SHAP Summary Bar Plot</h3>
                     <p className="mt-2 text-gray-600 max-w-lg mx-auto">
@@ -471,6 +500,7 @@ export default function UnifiedExplanationPage() {
               if (globalShap && globalShap.global_importance) {
                 return (
                   <FeatureImportanceBar
+                    key={tab.id}
                     data={globalShap.global_importance}
                     title="SHAP Feature Importance (Global)"
                     height={400}
@@ -483,7 +513,7 @@ export default function UnifiedExplanationPage() {
             case 'shap-beeswarm':
               if (!globalShapHasData) {
                 return (
-                  <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+                  <div key={tab.id} className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
                     <BarChart3 className="mx-auto h-16 w-16 text-gray-400" />
                     <h3 className="mt-4 text-xl font-semibold text-gray-900">SHAP Beeswarm Plot</h3>
                     <p className="mt-2 text-gray-600 max-w-lg mx-auto">
@@ -529,6 +559,7 @@ export default function UnifiedExplanationPage() {
               if (globalShap && globalShap.shap_values && globalShap.feature_names) {
                 return (
                   <SHAPBeeswarm
+                    key={tab.id}
                     shapValues={globalShap.shap_values}
                     featureNames={globalShap.feature_names}
                     title="SHAP Beeswarm Plot (Global Distribution)"
@@ -542,7 +573,7 @@ export default function UnifiedExplanationPage() {
               if (!localShap || !localShap.shap_values) {
                 if (localShap?.status === 'pending' || localShapLoading) {
                   return (
-                    <div className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
+                    <div key={tab.id} className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
                       <div className="text-center">
                         <Loader2 className="mx-auto h-10 w-10 animate-spin text-yellow-500" />
                         <h3 className="mt-4 text-lg font-semibold text-yellow-800">Computing SHAP...</h3>
@@ -552,7 +583,7 @@ export default function UnifiedExplanationPage() {
                   );
                 }
                 return (
-                  <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+                  <div key={tab.id} className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
                     <BarChart3 className="mx-auto h-16 w-16 text-gray-400" />
                     <h3 className="mt-4 text-xl font-semibold text-gray-900">SHAP Force Plot</h3>
                     <p className="mt-2 text-gray-600 max-w-lg mx-auto">
@@ -591,6 +622,7 @@ export default function UnifiedExplanationPage() {
 
               return (
                 <SHAPWaterfall
+                  key={tab.id}
                   shapValues={shapValuesFormatted}
                   baseValue={baseValue}
                   prediction={predValue}
@@ -603,7 +635,7 @@ export default function UnifiedExplanationPage() {
               if (!localLime || !localLime.lime_weights) {
                 if (localLime?.status === 'pending' || localLimeLoading) {
                   return (
-                    <div className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
+                    <div key={tab.id} className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
                       <div className="text-center">
                         <Loader2 className="mx-auto h-10 w-10 animate-spin text-purple-500" />
                         <h3 className="mt-4 text-lg font-semibold text-purple-800">Computing LIME...</h3>
@@ -613,7 +645,7 @@ export default function UnifiedExplanationPage() {
                   );
                 }
                 return (
-                  <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+                  <div key={tab.id} className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
                     <Brain className="mx-auto h-16 w-16 text-gray-400" />
                     <h3 className="mt-4 text-xl font-semibold text-gray-900">LIME Local Explanation</h3>
                     <p className="mt-2 text-gray-600 max-w-lg mx-auto">
@@ -642,6 +674,7 @@ export default function UnifiedExplanationPage() {
               const limeWeights = localLime.lime_weights || [];
               return (
                 <LIMEPlot
+                  key={tab.id}
                   data={limeWeights}
                   intercept={localLime.lime_intercept}
                   localPred={localLime.lime_local_pred}

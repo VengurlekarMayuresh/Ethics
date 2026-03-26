@@ -31,6 +31,9 @@ class ModelResponse(ModelBase):
     background_data_path: Optional[str] = None
     metrics: dict = {}
     model_category: Optional[str] = None  # "linear", "tree", "neural_network", "unknown"
+    model_type: Optional[str] = None  # e.g., "RandomForestRegressor", "XGBRegressor"
+    model_family: Optional[str] = None  # "tree", "linear", "svm", "neighbors", etc.
+    is_tree_based: Optional[bool] = False  # Quick flag for SHAP optimization
     created_at: datetime
     updated_at: datetime
 

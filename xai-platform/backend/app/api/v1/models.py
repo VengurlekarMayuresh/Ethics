@@ -18,7 +18,7 @@ async def upload_model(
     name: str = Form(...),
     description: str = Form(""),
     framework: str = Form(...),
-    task_type: str = Form(...),
+    task_type: Optional[str] = Form(None),  # Auto-detected if not provided
     feature_schema: str = Form("[]"),  # JSON string, optional (auto-generated if empty)
     file: UploadFile = File(...),
     background_data: UploadFile = File(None),  # Optional CSV dataset
@@ -42,10 +42,20 @@ async def upload_model(
         # Use detected framework from file extension
         framework_to_use = detected_framework
 
-        # Attempt to detect task_type from model as well
+        # Attempt to detect task_type from model
         model_info = await ModelLoaderService.get_model_info(model_obj, framework_to_use)
         detected_task_type = model_info.get("task_type", "unknown")
-        task_type_to_use = detected_task_type if detected_task_type != "unknown" else task_type
+
+        # Prefer auto-detected task_type; fall back to provided if detection fails
+        if detected_task_type != "unknown":
+            task_type_to_use = detected_task_type
+        elif task_type:
+            task_type_to_use = task_type
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not automatically determine task type (classification/regression). Please provide it manually."
+            )
     except Exception as e:
         msg = str(e)
         if not msg.lower().startswith("failed to load model"):
@@ -112,6 +122,10 @@ async def upload_model(
         "version": "1.0",
         "metrics": {},
         "model_category": model_category,  # Store for explainability
+        # New: specific estimator details
+        "model_type": model_info["estimator_info"]["estimator_name"],
+        "model_family": model_info["estimator_info"]["estimator_family"],
+        "is_tree_based": model_info["estimator_info"]["is_tree_based"],
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow()
     }

@@ -43,6 +43,8 @@ export default function PredictionForm({
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['predictions'] });
       onSuccess?.(data.prediction_id);
+      // Automatically navigate to explanation page to show SHAP and LIME
+      router.push(`/explain/local/${modelId}/${data.prediction_id}`);
     },
     onError: (error: any) => {
       const message = error.response?.data?.detail || 'Prediction failed';

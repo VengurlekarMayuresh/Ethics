@@ -53,6 +53,7 @@ export default function GlobalExplanationPage() {
   const [dependenceData, setDependenceData] = useState<{ x_values: number[]; shap_values: number[] } | null>(null);
   const [dependenceFeatureFile, setDependenceFeatureFile] = useState<File | null>(null);
   const [isLoadingDependence, setIsLoadingDependence] = useState(false);
+  const [autoTriggeredGlobal, setAutoTriggeredGlobal] = useState(false);
 
   // Fetch model
   const { data: model, isLoading: modelLoading } = useQuery<Model>({

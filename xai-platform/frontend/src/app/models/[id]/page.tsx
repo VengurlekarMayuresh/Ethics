@@ -39,6 +39,9 @@ interface Model {
   feature_schema: FeatureSchema[];
   created_at: string;
   background_data_path?: string;
+  model_type?: string;  // e.g., "RandomForestRegressor"
+  model_family?: string; // "tree", "linear", "svm", etc.
+  is_tree_based?: boolean;
 }
 
 export default function ModelDetailPage() {
@@ -234,6 +237,34 @@ export default function ModelDetailPage() {
                   <p className="font-medium text-gray-900">{taskTypeLabels[model.task_type] || model.task_type}</p>
                 </div>
               </div>
+              {model.model_type && (
+                <div className="flex items-center gap-3">
+                  <div className="h-5 w-5 flex items-center justify-center">
+                    <svg className="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                    </svg>
+                  </div>
+                  <div>
+                    <p className="text-sm text-gray-500">Algorithm</p>
+                    <p className="font-medium text-gray-900">{model.model_type}</p>
+                  </div>
+                </div>
+              )}
+              {model.model_family && (
+                <div className="flex items-center gap-3">
+                  <div className="h-5 w-5 flex items-center justify-center">
+                    <svg className="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                    </svg>
+                  </div>
+                  <div>
+                    <p className="text-sm text-gray-500">Model Family</p>
+                    <p className="inline-flex items-center rounded-full bg-purple-50 px-2 py-1 text-xs font-medium text-purple-700 capitalize">
+                      {model.model_family}
+                    </p>
+                  </div>
+                </div>
+              )}
               <div className="flex items-center gap-3">
                 <Calendar className="h-5 w-5 text-gray-400" />
                 <div>
