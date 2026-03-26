@@ -310,8 +310,41 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
                     # Here we'll take the mean absolute value across classes.
                     shap_values = np.mean([np.abs(arr) for arr in shap_values], axis=0)
 
-            # Calculate global importance
-            mean_abs_shap = np.abs(shap_values).mean(axis=0)
+            # Validate shap_values and feature_names
+            shap_array = np.asarray(shap_values)
+            if shap_array.ndim == 1:
+                # Ensure 2D: single sample -> (1, n_features)
+                shap_array = shap_array.reshape(1, -1)
+            elif shap_array.ndim > 2:
+                # Reduce to 2D: average across extra dimensions (should not happen)
+                logger.warning(f"[compute_global_shap] shap_values has {shap_array.ndim} dimensions, reducing to 2D by averaging extra axes")
+                # Average across all axes except the last one (features)
+                axes_to_average = tuple(range(shap_array.ndim - 1))
+                shap_array = np.mean(shap_array, axis=axes_to_average)
+                # Ensure still 2D
+                if shap_array.ndim == 1:
+                    shap_array = shap_array.reshape(1, -1)
+
+            n_samples, n_features = shap_array.shape[0], shap_array.shape[1] if shap_array.ndim >= 2 else 0
+
+            if n_features == 0:
+                raise ValueError("SHAP values have zero features - check model and background data compatibility")
+
+            if len(feature_names) != n_features:
+                logger.error(f"[compute_global_shap] Mismatch: shap_array features={n_features}, feature_names count={len(feature_names)}")
+                # Attempt to reconcile: if feature_names > n_features, truncate; else pad with generic names
+                if len(feature_names) > n_features:
+                    feature_names = feature_names[:n_features]
+                else:
+                    feature_names = feature_names + [f"feature_{i}" for i in range(len(feature_names), n_features)]
+                logger.info(f"[compute_global_shap] Adjusted feature_names to {len(feature_names)}")
+
+            # Compute global importance
+            mean_abs_shap = np.abs(shap_array).mean(axis=0)
+            # Validate: replace any NaN/Inf with 0 to prevent frontend issues
+            if np.any(~np.isfinite(mean_abs_shap)):
+                logger.warning(f"[compute_global_shap] mean_abs_shap contains non-finite values, replacing with 0")
+                mean_abs_shap = np.nan_to_num(mean_abs_shap, nan=0.0, posinf=0.0, neginf=0.0)
             feature_importance = [
                 {"feature": name, "importance": float(value)}
                 for name, value in zip(feature_names, mean_abs_shap)
@@ -319,6 +352,12 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
 
             # Sort by importance
             feature_importance.sort(key=lambda x: x["importance"], reverse=True)
+
+            # Sanitize shap_array to remove NaN/Inf
+            shap_array = np.nan_to_num(shap_array, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Convert shap_array back to list for storage
+            shap_values = shap_array.tolist()
 
             self.update_state(state="PROGRESS", meta={"status": "saving results", "progress": 100})
 
@@ -578,6 +617,12 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
                 samples_for_explanation,
                 num_features=num_features
             )
+
+            # Validate: ensure feature_importance is not empty
+            lime_feature_importance = lime_global.get("feature_importance", [])
+            if not lime_feature_importance:
+                logger.error("[compute_global_lime] LIME returned empty feature_importance - background data may be invalid or LIME failed")
+                raise ValueError("Global LIME failed to produce feature importance")
 
             self.update_state(state="PROGRESS", meta={"status": "saving results", "progress": 100})
 

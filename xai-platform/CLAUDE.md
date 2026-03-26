@@ -393,6 +393,48 @@ See `backend/.env.production.example` for all available variables. Key ones:
 - Added comprehensive exception logging to global SHAP request and retrieval endpoints to aid debugging.
 - Errors are now printed with full tracebacks to backend logs for quicker issue resolution.
 
+## Recent Improvements (2026-03-27)
+
+### Feature Schema Generation Fix (Categorical Dropdowns)
+- **Problem**: Models with pipelines starting directly with `ColumnTransformer` (without a custom `FeatureEngineer` step) had categorical features incorrectly labeled as numeric. This caused the frontend to show number inputs instead of dropdowns for categorical fields.
+- **Root cause**: The `generate_feature_schema()` function in `model_loader_service.py` would find the raw feature step but then fail to locate a subsequent preprocessor to infer feature types, leaving `feature_types` empty (default numeric).
+- **Fix**: Added fallback logic to use `raw_feature_step` itself as the preprocessor when it contains `transformers_`. This applies to:
+  - Feature type detection (categorical vs numeric)
+  - Categorical options extraction from `OneHotEncoder`
+- **Impact**: Categorical features now correctly show dropdowns with actual values (e.g., "Male", "Female", "Urban", "Rural") in the prediction form.
+
+### Global SHAP/LIME 404 Fix (model_id Query)
+- **Problem**: The `GET /explain/global/{model_id}/latest` and `GET /explain/lime/global/{model_id}/latest` endpoints returned 404 even when explanations existed in the database.
+- **Root cause**: Some models stored `model_id` as `ObjectId` in the `explanations` collection, while the query used a string. MongoDB treats these as different types, causing no match.
+- **Fix**: Changed queries to use `$in` operator to match both string and `ObjectId` representations:
+  ```python
+  query["model_id"] = {"$in": [model_id, ObjectId(model_id)]} if ObjectId.is_valid(model_id) else model_id
+  ```
+- **Impact**: Global explanation endpoints now correctly retrieve existing explanations.
+
+### SHAP Additivity Check Disabled
+- **Problem**: TreeExplainer failed with "Additivity check failed" error, especially for models with large value ranges. This forced fallback to extremely slow KernelExplainer or caused task failure.
+- **Root cause**: The additivity check verifies that SHAP values sum to the model output, but numerical precision issues with large values cause this to fail incorrectly.
+- **Fix**: Added `check_additivity=False` parameter to all `shap.Explainer` and `shap.TreeExplainer` calls in `_compute_shap()`.
+- **Impact**: SHAP computations now succeed quickly using TreeExplainer (seconds/minutes) instead of falling back to KernelExplainer (hours) or failing.
+
+### Global SHAP Data Validation & Sanitization
+- **Problem**: The `_compute_shap` function could return invalid data structures:
+  - `shap_values` as 1D array when only one background sample → frontend expects 2D
+  - Mismatch between `shap_values` shape and `feature_names` length (especially after one-hot aggregation)
+  - Non-finite values (NaN/Inf) in SHAP values causing frontend rendering issues
+- **Fix** (in `backend/app/workers/tasks.py`):
+  - **Shape validation**: Ensures `shap_values` is at least 2D; reshapes 1D to (1, n_features); averages >2D to 2D.
+  - **Length reconciliation**: Truncates or pads `feature_names` to match `shap_values.shape[1]`.
+  - **Sanitization**: Applies `np.nan_to_num` to replace NaN/Inf with 0 before storage.
+  - **Validation checks**: Raises clear errors if `shap_values` has zero features after processing.
+- **Impact**: Frontend receives clean, valid data and can render SHAP graphs correctly.
+
+### Global LIME Validation
+- **Problem**: If all LIME samples failed during computation, `lime_global["feature_importance"]` would be empty. The task would succeed and save an empty list, causing the frontend to display nothing without error indication.
+- **Fix**: After calling `LIMEService.explain_global()`, check if `feature_importance` is empty. If so, log an error and raise an exception to fail the task visibly.
+- **Impact**: Empty LIME results now clearly indicate failure, prompting user to retry with different background data.
+
 ## Data Flow
 
 ## Data Flow
@@ -485,6 +527,7 @@ See `backend/.env.production.example` for all available variables. Key ones:
 3. **Background dataset has NaN values**: This causes SHAP to fall back to extremely slow KernelExplainer or fail. Clean your CSV by filling missing values.
 4. **Background dataset missing required features**: The upload will succeed, but computation will fail. Ensure your CSV contains all features from the model's schema (accessible on model details page).
 5. **Frontend not polling**: Recent fix added automatic polling. If still not working, check browser console for errors.
+6. **Feature schema incorrect**: If categorical features show as numeric inputs, delete and re-upload the model to regenerate correct schema (see Feature Schema Generation Fix above).
 
 ### Issue: Global SHAP taking >10 minutes
 
@@ -497,13 +540,64 @@ See `backend/.env.production.example` for all available variables. Key ones:
 - For tree models (RandomForest, XGBoost, LightGBM): Ensure background data has **no NaN values**.
 - Check worker logs for "Using 200 background data samples..." warning - indicates KernelExplainer path.
 - After fixing, tree-based global SHAP should complete in **under 2 minutes** for 200 samples.
+- **Note**: As of 2026-03-27, `check_additivity=False` is enabled, so additivity check failures no longer cause fallback.
 
 ### Issue: 404 on `/explain/global/{modelId}/latest`
 
-**This is expected behavior** if no global explanation exists yet. You must:
-1. Upload background data via the "Request Global Explanation" form
-2. Wait for the async task to complete (polling will自动 refresh)
-3. Once complete, the endpoint will return 200 with data
+**Previous behavior (fixed 2026-03-27)**: This could return 404 even when an explanation existed due to `model_id` type mismatch (string vs ObjectId).
+
+**Now**: The query matches both string and ObjectId representations. If you still see 404:
+1. Ensure you've uploaded background data and the task completed successfully (check Celery logs).
+2. Verify the explanation exists in the database:
+   ```bash
+   docker-compose exec backend python3 -c "
+   import asyncio
+   from app.db.mongo import connect_db, get_db
+   async def check():
+       await connect_db()
+       db = await get_db()
+       import sys
+       model_id = sys.argv[1] if len(sys.argv) > 1 else 'YOUR_MODEL_ID'
+       count = await db.explanations.count_documents({'model_id': model_id, 'explanation_type': 'global', 'method': 'shap'})
+       print(f'Global SHAP explanations for {model_id}: {count}')
+   asyncio.run(check())
+   " YOUR_MODEL_ID
+   ```
+3. If count is 0, the task may have failed. Check Celery worker logs for errors.
+
+### Issue: Explanation tasks succeed but graphs show nothing (empty charts)
+
+**Possible causes and solutions:**
+
+1. **Background data quality**: Ensure background dataset has:
+   - All required features from model's feature schema
+   - **No missing values (NaN)** – impute before upload
+   - At least 2-3 rows (more is better, e.g., 50-200)
+2. **Check backend logs**: Look for warnings from `_compute_shap` about:
+   - Shape mismatches
+   - Non-finite values (NaN/Inf) that may have been sanitized to zero
+   - Feature name adjustments
+3. **Verify saved data**: Check the explanation document in MongoDB:
+   ```bash
+   docker-compose exec backend python3 -c "
+   import asyncio, json
+   from app.db.mongo import connect_db, get_db
+   from bson import ObjectId
+   async def check():
+       await connect_db()
+       db = await get_db()
+       exp = await db.explanations.find_one({'explanation_type': 'global'}, sort=[('created_at', -1)])
+       if exp:
+           print('shap_values shape:', len(exp['shap_values']), 'x', len(exp['shap_values'][0]) if exp['shap_values'] else 0)
+           print('feature_names count:', len(exp['feature_names']))
+           print('global_importance count:', len(exp.get('global_importance', [])))
+   asyncio.run(check())
+   "
+   ```
+   - `shap_values` should be a 2D array (samples × features)
+   - `feature_names` count should equal `shap_values` columns
+   - `global_importance` should have non-zero importance values for most features
+4. **Refresh frontend**: Clear browser cache and hard refresh (Ctrl+F5) to ensure latest frontend code.
 
 ### Checking Task Status Manually
 
