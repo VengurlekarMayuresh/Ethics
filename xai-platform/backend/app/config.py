@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     # Comma-separated module paths that define custom classes used in pickled models.
     # These classes are injected into __main__ during sklearn/joblib loading to support
     # models serialized from notebooks/scripts where classes were defined in __main__.
-    PICKLE_CLASS_MODULES: str = "app.custom.feature_engineer"
+    PICKLE_CLASS_MODULES: str = "app.custom.loan_feature_engineer"
 
     model_config = SettingsConfigDict(env_file=".env")
 

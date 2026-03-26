@@ -656,41 +656,48 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
         # Check if model is a sklearn Pipeline
         if isinstance(model_obj, Pipeline):
             logger.info("[_compute_shap] Model is a Pipeline - preprocessing required")
-            # For pipelines, we need to work in the preprocessed feature space
-            # because the model expects numeric inputs after preprocessing.
-
-            # Find the preprocessing step in the pipeline
-            preprocessor = None
-            for step_name, step_obj in model_obj.steps:
-                if hasattr(step_obj, 'transform'):
-                    preprocessor = step_obj
-                    break
-            logger.info(f"[_compute_shap] Found preprocessor: {type(preprocessor).__name__ if preprocessor else 'None'}")
-
-            # Get the final estimator for prediction
+            # For pipelines, we need to preprocess data using all transformer steps before the final estimator.
+            # This handles pipelines with multiple preprocessing steps (e.g., FeatureEngineer + ColumnTransformer).
+            from sklearn.pipeline import Pipeline
+            # Build a composite preprocessor from all steps except the final estimator.
+            preprocessor = Pipeline(model_obj.steps[:-1])
             final_estimator = model_obj.steps[-1][1]
             logger.info(f"[_compute_shap] Final estimator: {type(final_estimator).__name__}")
 
-            # Determine final_feature_names from preprocessor (if available)
-            # This is needed for aggregating one-hot encoded features later.
+            # Also find the step that expands features (e.g., ColumnTransformer with OneHotEncoder)
+            # This is needed to aggregate one-hot encoded SHAP values back to original categorical features.
+            feature_expander = None
+            for step_name, step_obj in preprocessor.steps:
+                if hasattr(step_obj, 'transformers_'):
+                    feature_expander = step_obj
+                    break
+
+            # Determine final_feature_names from the preprocessor's last step that provides feature names
             final_feature_names = expected_columns  # default fallback
-            if preprocessor is not None and hasattr(preprocessor, 'get_feature_names_out'):
-                logger.debug("[_compute_shap] Attempting to get feature names from preprocessor")
-                try:
-                    raw_names = preprocessor.get_feature_names_out()
-                    cleaned_names = []
-                    for name in raw_names:
-                        if isinstance(name, bytes):
-                            name = name.decode('utf-8')
-                        if '__' in name:
-                            name = name.split('__', 1)[1]
-                        cleaned_names.append(name)
-                    final_feature_names = cleaned_names
-                    logger.info(f"[_compute_shap] Extracted {len(final_feature_names)} feature names from preprocessor")
-                    logger.debug(f"[_compute_shap] First 10 final_feature_names: {final_feature_names[:10]}")
-                except Exception as e:
-                    logger.warning(f"[_compute_shap] Failed to get feature names from preprocessor: {e}")
-                    pass  # keep default
+            # Try to get feature names from the last step that has get_feature_names_out
+            for step_name, step_obj in reversed(preprocessor.steps):
+                if hasattr(step_obj, 'get_feature_names_out'):
+                    try:
+                        # Some transformers (like ColumnTransformer) may use feature_names_in_
+                        if hasattr(step_obj, 'feature_names_in_'):
+                            input_features = step_obj.feature_names_in_
+                            raw_names = step_obj.get_feature_names_out(input_features=input_features)
+                        else:
+                            raw_names = step_obj.get_feature_names_out()
+                        # Clean up names: remove transformer prefix like 'cat__' or 'num__'
+                        cleaned_names = []
+                        for name in raw_names:
+                            if isinstance(name, bytes):
+                                name = name.decode('utf-8')
+                            if '__' in name:
+                                name = name.split('__', 1)[1]
+                            cleaned_names.append(name)
+                        final_feature_names = cleaned_names
+                        logger.info(f"[_compute_shap] Extracted {len(final_feature_names)} feature names from preprocessor step '{step_name}'")
+                        break
+                    except Exception as e:
+                        logger.debug(f"[_compute_shap] Could not get feature names from step '{step_name}': {e}")
+                        continue
 
             # Prepare background data (raw) - align columns, use FULL background if available
             if background_data is not None and len(background_data) > 0:
@@ -842,40 +849,37 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                     preprocessor = step_obj
                     break
 
-            if preprocessor and hasattr(preprocessor, 'get_feature_names_out'):
-                # We have a preprocessor that expanded features (e.g., OneHotEncoder)
-                # Build mapping from original feature to encoded column indices
+            if feature_expander is not None:
+                # We have a feature expander (e.g., ColumnTransformer) that created one-hot encoded features
+                # Build mapping from original categorical feature to encoded column indices
                 from collections import defaultdict
                 original_to_encoded = defaultdict(list)
                 original_feature_names_set = set()
 
-                if hasattr(preprocessor, 'transformers_'):
-                    logger.debug(f"[_compute_shap] Preprocessor has transformers_: {len(preprocessor.transformers_)} transformers")
-                    for transformer_name, transformer_obj, cols in preprocessor.transformers_:
-                        transformer_class = transformer_obj.__class__.__name__
-                        logger.debug(f"[_compute_shap] Transformer: name={transformer_name}, class={transformer_class}, cols={cols}")
-                        for col in cols:
-                            original_feature_names_set.add(col)
-                            # Find all encoded columns that belong to this original column
-                            col_str = str(col)  # Convert to string to handle both integer indices and string names
-                            for idx, fname in enumerate(final_feature_names):
-                                if isinstance(fname, bytes):
-                                    fname = fname.decode('utf-8')
-                                fname_str = str(fname)
-                                # Normalize: remove transformer prefix if present (e.g., "cat__name_X" -> "name_X")
-                                if '__' in fname_str:
-                                    parts = fname_str.split('__', 1)
-                                    norm_name = parts[1] if len(parts) == 2 else fname_str
-                                else:
-                                    norm_name = fname_str
-                                # Match: exact match for numeric, or starts with "col_" for one-hot
-                                if norm_name == col_str or norm_name.startswith(col_str + '_'):
-                                    original_to_encoded[col].append(idx)  # Use original col (not col_str) as key
+                # feature_expander has transformers_ attribute
+                logger.debug(f"[_compute_shap] Feature expander has transformers_: {len(feature_expander.transformers_)} transformers")
+                for transformer_name, transformer_obj, cols in feature_expander.transformers_:
+                    transformer_class = transformer_obj.__class__.__name__
+                    logger.debug(f"[_compute_shap] Transformer: name={transformer_name}, class={transformer_class}, cols={cols}")
+                    for col in cols:
+                        original_feature_names_set.add(col)
+                        col_str = str(col)
+                        for idx, fname in enumerate(final_feature_names):
+                            if isinstance(fname, bytes):
+                                fname = fname.decode('utf-8')
+                            fname_str = str(fname)
+                            if '__' in fname_str:
+                                parts = fname_str.split('__', 1)
+                                norm_name = parts[1] if len(parts) == 2 else fname_str
+                            else:
+                                norm_name = fname_str
+                            if norm_name == col_str or norm_name.startswith(col_str + '_'):
+                                original_to_encoded[col].append(idx)
 
-                    logger.info(f"[_compute_shap] Aggregation mapping built: {len(original_to_encoded)} original features mapped")
-                    logger.debug(f"[_compute_shap] original_to_encoded keys (first 5): {list(original_to_encoded.keys())[:5]}")
-                    for k, v in list(original_to_encoded.items())[:5]:
-                        logger.debug(f"[_compute_shap]   {k!r} -> indices {v}")
+                logger.info(f"[_compute_shap] Aggregation mapping built: {len(original_to_encoded)} original features mapped")
+                logger.debug(f"[_compute_shap] original_to_encoded keys (first 5): {list(original_to_encoded.keys())[:5]}")
+                for k, v in list(original_to_encoded.items())[:5]:
+                    logger.debug(f"[_compute_shap]   {k!r} -> indices {v}")
 
                 # If we found any grouping, aggregate
                 if original_to_encoded:
@@ -885,11 +889,7 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                     # Ensure shap_values is 2D
                     if isinstance(shap_values, list):
                         logger.debug(f"[_compute_shap] shap_values is a list with {len(shap_values)} classes")
-                        # For classification, we take the class 1 (positive) for binary, or first class
-                        # Convert to 2D array
                         if len(shap_values) > 0:
-                            # shap_values[i] is for class i
-                            # We'll aggregate for class 1 if binary and 2 classes, else class 0
                             if len(shap_values) == 2:
                                 class_idx = 1
                             else:
@@ -919,14 +919,12 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                             elif len(encoded_indices) > 1:
                                 # Sum contributions from all encoded columns
                                 aggregated_shap[:, agg_idx] = shap_arr[:, encoded_indices].sum(axis=1)
-                            # else: feature not found (shouldn't happen) - leave as 0
 
                         shap_values = aggregated_shap
                         final_feature_names = orig_features_list
                         logger.info(f"[_compute_shap] Aggregation complete: final shap_values shape={shap_values.shape}, final_feature_names count={len(final_feature_names)}")
                     else:
                         logger.warning(f"[_compute_shap] shap_arr is not 2D or has 0 samples, skipping aggregation")
-                    # else: shap_values is empty or malformed, leave as-is
 
         logger.info(f"[_compute_shap] RETURN: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}, final_feature_names count={len(final_feature_names)}")
         return shap_values, expected_value, final_feature_names

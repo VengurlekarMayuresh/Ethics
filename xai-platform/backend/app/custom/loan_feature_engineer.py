@@ -27,24 +27,25 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         - Total_IncomeLog
     """
 
+    # Define which columns are numeric (for validation and log transforms)
+    numeric_features = [
+        'ApplicantIncome',
+        'CoapplicantIncome',
+        'LoanAmount',
+        'Loan_Amount_Term',
+        'Credit_History'
+    ]
+    categorical_features = [
+        'Gender',
+        'Married',
+        'Dependents',
+        'Education',
+        'Self_Employed',
+        'Property_Area'
+    ]
+
     def __init__(self):
         self.raw_feature_names = None
-        # Define which columns are numeric (for validation and log transforms)
-        self.numeric_features = [
-            'ApplicantIncome',
-            'CoapplicantIncome',
-            'LoanAmount',
-            'Loan_Amount_Term',
-            'Credit_History'
-        ]
-        self.categorical_features = [
-            'Gender',
-            'Married',
-            'Dependents',
-            'Education',
-            'Self_Employed',
-            'Property_Area'
-        ]
 
     def fit(self, X, y=None):
         """Store raw feature names for schema extraction."""
@@ -74,10 +75,10 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
 
         # Create derived features
         X_df['Total_Income'] = X_df['ApplicantIncome'] + X_df['CoapplicantIncome']
-        X_df['ApplicantIncomeLog'] = np.log(X_df['ApplicantIncome'] + 1)
-        X_df['CoapplicantIncomeLog'] = np.log(X_df['CoapplicantIncome'] + 1)
-        X_df['LoanAmountLog'] = np.log(X_df['LoanAmount'] + 1)
-        X_df['Loan_Amount_Term_Log'] = np.log(X_df['Loan_Amount_Term'] + 1)
-        X_df['Total_IncomeLog'] = np.log(X_df['Total_Income'] + 1)
+        X_df['ApplicantIncomeLog'] = np.log1p(X_df['ApplicantIncome'])
+        X_df['CoapplicantIncomeLog'] = np.log1p(X_df['CoapplicantIncome'])
+        X_df['LoanAmountLog'] = np.log1p(X_df['LoanAmount'])
+        X_df['Loan_Amount_Term_Log'] = np.log1p(X_df['Loan_Amount_Term'])
+        X_df['Total_IncomeLog'] = np.log1p(X_df['Total_Income'])
 
         return X_df

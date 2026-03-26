@@ -485,8 +485,8 @@ class ModelLoaderService:
                 # For categorical, we need to extract options from the transformer if possible
                 if feature_type == "categorical":
                     # Try to get categories from the preprocessor
-                    if preprocessing_step and hasattr(preprocessing_step, 'transformers_'):
-                        for transformer_name, transformer_obj, cols in preprocessing_step.transformers_:
+                    if preprocessor and hasattr(preprocessor, 'transformers_'):
+                        for transformer_name, transformer_obj, cols in preprocessor.transformers_:
                             if name in cols and hasattr(transformer_obj, 'categories_'):
                                 # Find index of this column in cols
                                 idx = list(cols).index(name)

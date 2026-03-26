@@ -64,48 +64,50 @@ class LIMEService:
 
         # Check if model is a sklearn Pipeline
         if isinstance(model, Pipeline):
-            # For pipelines, preprocess the training data to numeric space
-            # Find the preprocessing step
-            preprocessor = None
-            for step_name, step_obj in model.steps:
-                if hasattr(step_obj, 'transform'):
-                    preprocessor = step_obj
-                    break
+            from sklearn.pipeline import Pipeline
+            # Build composite preprocessor from all steps except the final estimator.
+            if len(model.steps) > 1:
+                preprocessor_pipeline = Pipeline(model.steps[:-1])
+            else:
+                preprocessor_pipeline = None
 
-            if preprocessor is not None:
-                # Transform raw training data to preprocessed numeric features
-                training_processed = preprocessor.transform(training_data)
+            if preprocessor_pipeline is not None:
+                # Transform raw training data through full preprocessing chain
+                training_processed = preprocessor_pipeline.transform(training_data)
                 if hasattr(training_processed, 'toarray'):  # sparse matrix
                     training_processed = training_processed.toarray()
                 training_array = np.asarray(training_processed, dtype=float)
 
-                # Try to get feature names from the preprocessor if available
+                # Determine processed feature names from the last step with get_feature_names_out
                 processed_feature_names = None
-                if hasattr(preprocessor, 'get_feature_names_out'):
-                    try:
-                        # Get feature names from ColumnTransformer
-                        raw_names = preprocessor.get_feature_names_out()
-                        # Clean up names: remove prefix like 'cat__' or 'num__'
-                        cleaned_names = []
-                        for name in raw_names:
-                            if isinstance(name, bytes):
-                                name = name.decode('utf-8')
-                            # Remove transformer prefix (everything before '__')
-                            if '__' in name:
-                                name = name.split('__', 1)[1]
-                            cleaned_names.append(name)
-                        processed_feature_names = cleaned_names
-                    except Exception:
-                        processed_feature_names = None
+                for step_name, step_obj in reversed(preprocessor_pipeline.steps):
+                    if hasattr(step_obj, 'get_feature_names_out'):
+                        try:
+                            if hasattr(step_obj, 'feature_names_in_'):
+                                input_features = step_obj.feature_names_in_
+                                raw_names = step_obj.get_feature_names_out(input_features=input_features)
+                            else:
+                                raw_names = step_obj.get_feature_names_out()
+                            cleaned_names = []
+                            for name in raw_names:
+                                if isinstance(name, bytes):
+                                    name = name.decode('utf-8')
+                                if '__' in name:
+                                    name = name.split('__', 1)[1]
+                                cleaned_names.append(name)
+                            if len(cleaned_names) == training_array.shape[1]:
+                                processed_feature_names = cleaned_names
+                                break
+                        except Exception:
+                            processed_feature_names = None
 
                 if processed_feature_names is None or len(processed_feature_names) != training_array.shape[1]:
-                    # Fallback to generic names
                     processed_feature_names = [f"feature_{i}" for i in range(training_array.shape[1])]
 
                 # No categorical features in preprocessed space (all numeric)
                 categorical_features = None
             else:
-                # No preprocessor, use raw data as-is
+                # No preprocessing steps, use raw data as-is
                 training_array = training_data.values
                 processed_feature_names = feature_names
                 # Auto-detect categorical features
@@ -309,38 +311,38 @@ class LIMEService:
             from collections import defaultdict
             from sklearn.pipeline import Pipeline
 
-            # Find preprocessor
-            preprocessor = None
+            # Find the ColumnTransformer (feature expander) for mapping encoded features to original categories
+            feature_expander = None
             for step_name, step_obj in model.steps:
-                if hasattr(step_obj, 'transform'):
-                    preprocessor = step_obj
+                if hasattr(step_obj, 'transformers_'):
+                    feature_expander = step_obj
                     break
 
-            if preprocessor and hasattr(explainer, 'feature_names'):
+            if feature_expander is not None and hasattr(explainer, 'feature_names'):
                 # Build mapping: preprocessed feature index -> original categorical feature name
                 encoded_to_original = {}
                 original_feature_names_set = set()
 
-                if hasattr(preprocessor, 'transformers_'):
-                    for transformer_name, transformer_obj, cols in preprocessor.transformers_:
-                        transformer_class = transformer_obj.__class__.__name__
+                # feature_expander has transformers_ attribute
+                for transformer_name, transformer_obj, cols in feature_expander.transformers_:
+                    transformer_class = transformer_obj.__class__.__name__
 
-                        for col in cols:
-                            original_feature_names_set.add(col)
-                            # Match encoded features to original column using normalized names
-                            for idx, fname in enumerate(explainer.feature_names):
-                                if isinstance(fname, bytes):
-                                    fname = fname.decode('utf-8')
-                                fname_str = str(fname)
-                                # Normalize: remove transformer prefix if present (e.g., "cat__name_X" -> "name_X")
-                                if '__' in fname_str:
-                                    parts = fname_str.split('__', 1)
-                                    norm_name = parts[1] if len(parts) == 2 else fname_str
-                                else:
-                                    norm_name = fname_str
-                                # Match: exact match for numeric features, or starts with "col_" for one-hot
-                                if norm_name == col or norm_name.startswith(col + '_'):
-                                    encoded_to_original[idx] = col
+                    for col in cols:
+                        original_feature_names_set.add(col)
+                        # Match encoded features to original column using normalized names
+                        for idx, fname in enumerate(explainer.feature_names):
+                            if isinstance(fname, bytes):
+                                fname = fname.decode('utf-8')
+                            fname_str = str(fname)
+                            # Normalize: remove transformer prefix if present (e.g., "cat__name_X" -> "name_X")
+                            if '__' in fname_str:
+                                parts = fname_str.split('__', 1)
+                                norm_name = parts[1] if len(parts) == 2 else fname_str
+                            else:
+                                norm_name = fname_str
+                            # Match: exact match for numeric features, or starts with "col_" for one-hot
+                            if norm_name == col or norm_name.startswith(col + '_'):
+                                encoded_to_original[idx] = col
 
                 # Perform aggregation if we have a mapping
                 if encoded_to_original:
