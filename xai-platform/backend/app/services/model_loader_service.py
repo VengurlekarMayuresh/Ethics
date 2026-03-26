@@ -429,6 +429,20 @@ class ModelLoaderService:
                             else:
                                 for col in cols:
                                     feature_types[col] = "numeric"
+                    # FALLBACK: If no separate preprocessor found, the raw_feature_step itself might be a ColumnTransformer
+                    elif raw_feature_step and hasattr(raw_feature_step, 'transformers_'):
+                        # The raw_feature_step is itself a preprocessor (e.g., pipeline starts with ColumnTransformer)
+                        for transformer_name, transformer_obj, cols in raw_feature_step.transformers_:
+                            transformer_class = transformer_obj.__class__.__name__
+                            if 'OneHotEncoder' in transformer_class:
+                                for col in cols:
+                                    feature_types[col] = "categorical"
+                            elif any(num_type in transformer_class for num_type in ['StandardScaler', 'MinMaxScaler', 'Normalizer', 'MaxAbsScaler']):
+                                for col in cols:
+                                    feature_types[col] = "numeric"
+                            else:
+                                for col in cols:
+                                    feature_types[col] = "numeric"
                 elif hasattr(model_obj, 'feature_names_in_'):
                     # Pipeline itself might have feature names (no steps with feature_names_in_)
                     feature_names = model_obj.feature_names_in_.tolist()
@@ -484,14 +498,26 @@ class ModelLoaderService:
                 feature_type = feature_types[name]
                 # For categorical, we need to extract options from the transformer if possible
                 if feature_type == "categorical":
-                    # Try to get categories from the preprocessor
+                    # Try to get categories from the preprocessor first
+                    source_transformer = None
                     if preprocessor and hasattr(preprocessor, 'transformers_'):
                         for transformer_name, transformer_obj, cols in preprocessor.transformers_:
                             if name in cols and hasattr(transformer_obj, 'categories_'):
+                                source_transformer = transformer_obj
                                 # Find index of this column in cols
                                 idx = list(cols).index(name)
                                 if idx < len(transformer_obj.categories_):
                                     # Get unique values for this column, convert to strings
+                                    raw_cats = transformer_obj.categories_[idx]
+                                    options = [str(cat) for cat in raw_cats]
+                                break
+                    # FALLBACK: If no preprocessor or didn't find, check raw_feature_step itself
+                    if not options and raw_feature_step and hasattr(raw_feature_step, 'transformers_'):
+                        for transformer_name, transformer_obj, cols in raw_feature_step.transformers_:
+                            if name in cols and hasattr(transformer_obj, 'categories_'):
+                                source_transformer = transformer_obj
+                                idx = list(cols).index(name)
+                                if idx < len(transformer_obj.categories_):
                                     raw_cats = transformer_obj.categories_[idx]
                                     options = [str(cat) for cat in raw_cats]
                                 break
