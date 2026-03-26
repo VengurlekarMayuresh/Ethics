@@ -460,29 +460,49 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             model_obj, framework = await ModelLoaderService.load_model(model["file_path"])
             logger.info(f"[compute_lime_values] Model loaded: framework={framework}, type={type(model_obj).__name__}")
 
+            # Prepare input instance FIRST so we know which columns to use
+            input_df = pd.DataFrame([prediction["input_data"]])
+            input_cols = list(input_df.columns)
+            logger.info(f"[compute_lime_values] Input instance columns ({len(input_cols)}): {input_cols}")
+
             # Get training data for LIME background
             if model.get("background_data_path"):
                 logger.info(f"[compute_lime_values] Downloading background data from {model['background_data_path']}")
                 bg_bytes = await storage.download_file(model["background_data_path"])
                 training_df = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
-                logger.info(f"[compute_lime_values] Background data loaded: shape={training_df.shape}")
+                logger.info(f"[compute_lime_values] Background data loaded: shape={training_df.shape}, columns={list(training_df.columns)}")
+                # Align training_df to ONLY include columns present in the input instance.
+                # Background CSV often includes target column and other extra columns that
+                # inflate training_array shape and cause LIME scaler shape mismatch.
+                common_cols = [c for c in input_cols if c in training_df.columns]
+                missing_cols = [c for c in input_cols if c not in training_df.columns]
+                if missing_cols:
+                    logger.warning(f"[compute_lime_values] Input columns not in background CSV: {missing_cols}. Will use synthetic data for those.")
+                if common_cols:
+                    training_df = training_df[common_cols]
+                else:
+                    logger.warning(f"[compute_lime_values] No common columns between input and background CSV! Using input-aligned fallback.")
+                    training_df = input_df  # will be expanded below
+                logger.info(f"[compute_lime_values] Background data after column alignment: shape={training_df.shape}")
             else:
                 # Fallback: build synthetic background from the single input row with Gaussian noise.
-                # Using pd.concat of 1 row repeated produces constant columns (zero variance),
-                # which causes LIME's discretizer to produce all-zero weights. Instead, add noise.
                 logger.warning(f"[compute_lime_values] No background_data_path. Building synthetic background from input_data with Gaussian noise.")
-                input_row = prediction["input_data"]
-                base_df = pd.DataFrame([input_row])
+                training_df = input_df.copy()
+
+            # If training_df is too small, expand with Gaussian noise
+            if len(training_df) < 50:
+                logger.info(f"[compute_lime_values] training_df only has {len(training_df)} rows — expanding with Gaussian noise to 100 rows")
+                base_df = training_df.copy()
                 rows = [base_df]
                 for _ in range(99):
-                    noisy = base_df.copy()
+                    noisy = base_df.sample(1, replace=True).copy()
                     for col in noisy.columns:
                         if pd.api.types.is_numeric_dtype(noisy[col]):
-                            std = abs(float(noisy[col].iloc[0])) * 0.2 + 1e-3
+                            std = max(float(noisy[col].iloc[0]) * 0.2, 1e-3)
                             noisy[col] = noisy[col] + np.random.normal(0, std, size=len(noisy))
                     rows.append(noisy)
                 training_df = pd.concat(rows, ignore_index=True)
-                logger.info(f"[compute_lime_values] Synthetic background built: shape={training_df.shape}")
+                logger.info(f"[compute_lime_values] Expanded background: shape={training_df.shape}")
 
             # Determine mode
             mode = "classification" if model.get("task_type") in ["classification", "binary_classification", "multiclass_classification"] else "regression"
@@ -490,7 +510,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
 
             self.update_state(state="PROGRESS", meta={"status": "creating LIME explainer", "progress": 50})
 
-            # Create explainer
+            # Create explainer — training_df now has same columns as input_df
             explainer = LIMEService.create_explainer(
                 model_obj,
                 framework,
@@ -500,12 +520,11 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             )
             logger.info(f"[compute_lime_values] Explainer created. feature_names count={len(getattr(explainer, 'feature_names', []))}")
 
-            # Get feature names from explainer (may be preprocessed if pipeline)
+            # Get feature names from explainer
             explainer_feature_names = getattr(explainer, 'feature_names', list(training_df.columns))
 
-            # Prepare input instance
-            input_df = pd.DataFrame([prediction["input_data"]])
-            input_values = input_df.values[0]
+            # Input instance (same columns as training_df)
+            input_values = input_df[list(training_df.columns)].values[0]
             logger.info(f"[compute_lime_values] Input instance shape: {input_values.shape}")
 
             # For pipelines: do NOT preprocess the instance.
