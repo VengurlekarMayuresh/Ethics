@@ -352,6 +352,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
     Async task to compute LIME explanation for a prediction.
     """
     try:
+        logger.info(f"[compute_lime_values] START: prediction_id={prediction_id}, model_id={model_id}, num_features={num_features}")
         self.update_state(state="PROGRESS", meta={"status": "loading model", "progress": 10})
 
         import asyncio
@@ -371,24 +372,40 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             if not model:
                 raise ValueError(f"Model {model_id} not found")
 
+            logger.info(f"[compute_lime_values] Prediction and model fetched. task_type={model.get('task_type')}, background_data_path={model.get('background_data_path')}")
             self.update_state(state="PROGRESS", meta={"status": "loading model file", "progress": 30})
 
             # Load model from storage
             model_obj, framework = await ModelLoaderService.load_model(model["file_path"])
+            logger.info(f"[compute_lime_values] Model loaded: framework={framework}, type={type(model_obj).__name__}")
 
             # Get training data for LIME background
-            # Use sample from prediction data or stored background data
             if model.get("background_data_path"):
+                logger.info(f"[compute_lime_values] Downloading background data from {model['background_data_path']}")
                 bg_bytes = await storage.download_file(model["background_data_path"])
                 training_df = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
+                logger.info(f"[compute_lime_values] Background data loaded: shape={training_df.shape}")
             else:
-                # Use prediction data as minimal background (not ideal but fallback)
-                training_df = pd.DataFrame([prediction["input_data"]])
-                # Add some noise perturbations for LIME background
-                training_df = pd.concat([training_df] * 100, ignore_index=True)
+                # Fallback: build synthetic background from the single input row with Gaussian noise.
+                # Using pd.concat of 1 row repeated produces constant columns (zero variance),
+                # which causes LIME's discretizer to produce all-zero weights. Instead, add noise.
+                logger.warning(f"[compute_lime_values] No background_data_path. Building synthetic background from input_data with Gaussian noise.")
+                input_row = prediction["input_data"]
+                base_df = pd.DataFrame([input_row])
+                rows = [base_df]
+                for _ in range(99):
+                    noisy = base_df.copy()
+                    for col in noisy.columns:
+                        if pd.api.types.is_numeric_dtype(noisy[col]):
+                            std = abs(float(noisy[col].iloc[0])) * 0.2 + 1e-3
+                            noisy[col] = noisy[col] + np.random.normal(0, std, size=len(noisy))
+                    rows.append(noisy)
+                training_df = pd.concat(rows, ignore_index=True)
+                logger.info(f"[compute_lime_values] Synthetic background built: shape={training_df.shape}")
 
             # Determine mode
             mode = "classification" if model.get("task_type") in ["classification", "binary_classification", "multiclass_classification"] else "regression"
+            logger.info(f"[compute_lime_values] LIME mode: {mode}")
 
             self.update_state(state="PROGRESS", meta={"status": "creating LIME explainer", "progress": 50})
 
@@ -400,6 +417,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
                 list(training_df.columns),
                 mode=mode
             )
+            logger.info(f"[compute_lime_values] Explainer created. feature_names count={len(getattr(explainer, 'feature_names', []))}")
 
             # Get feature names from explainer (may be preprocessed if pipeline)
             explainer_feature_names = getattr(explainer, 'feature_names', list(training_df.columns))
@@ -407,6 +425,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             # Prepare input instance
             input_df = pd.DataFrame([prediction["input_data"]])
             input_values = input_df.values[0]
+            logger.info(f"[compute_lime_values] Input instance shape: {input_values.shape}")
 
             # For pipelines, preprocess the input instance to match the explainer's feature space
             instance_to_explain = input_values
@@ -423,16 +442,27 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
                     if hasattr(processed_input, 'toarray'):
                         processed_input = processed_input.toarray()
                     instance_to_explain = np.asarray(processed_input, dtype=float)[0]
+                    logger.info(f"[compute_lime_values] Preprocessed input shape: {instance_to_explain.shape}")
 
             self.update_state(state="PROGRESS", meta={"status": "computing LIME values", "progress": 70})
 
             # Compute LIME explanation
-            lime_data = LIMEService.explain_instance(
-                explainer,
-                model_obj,
-                instance_to_explain,
-                num_features=num_features
-            )
+            try:
+                lime_data = LIMEService.explain_instance(
+                    explainer,
+                    model_obj,
+                    instance_to_explain,
+                    num_features=num_features
+                )
+                logger.info(f"[compute_lime_values] explain_instance returned: list_of_contributions count={len(lime_data.get('list_of_contributions', []))}")
+            except Exception as lime_err:
+                logger.error(f"[compute_lime_values] LIMEService.explain_instance FAILED: {type(lime_err).__name__}: {lime_err}")
+                logger.error(f"[compute_lime_values] Full traceback:\n{traceback.format_exc()}")
+                raise
+
+            contributions = lime_data.get("list_of_contributions", [])
+            if not contributions:
+                logger.warning(f"[compute_lime_values] list_of_contributions is EMPTY. lime_data keys: {list(lime_data.keys())}. local_exp: {lime_data.get('local_exp', {})}")
 
             self.update_state(state="PROGRESS", meta={"status": "saving results", "progress": 90})
 
@@ -442,7 +472,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
                 "model_id": model_id,
                 "method": "lime",
                 "explanation_type": "local",
-                "lime_weights": lime_data.get("list_of_contributions", []),
+                "lime_weights": contributions,
                 "lime_intercept": lime_data.get("intercept"),
                 "lime_local_pred": lime_data.get("local_pred"),
                 "feature_names": explainer_feature_names,
@@ -454,6 +484,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
 
             result = await db.explanations.insert_one(explanation_doc)
             explanation_id = str(result.inserted_id)
+            logger.info(f"[compute_lime_values] Explanation saved: explanation_id={explanation_id}, lime_weights count={len(contributions)}")
 
             self.update_state(state="SUCCESS", meta={"status": "complete", "explanation_id": explanation_id, "progress": 100})
 
@@ -462,6 +493,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
         return asyncio.run(async_task())
 
     except Exception:
+        logger.error(f"[compute_lime_values] TASK FAILED:\n{traceback.format_exc()}")
         raise
 
 @celery_app.task(bind=True, name="compute_global_lime")
@@ -751,8 +783,8 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
             shap_values = None
             expected_value = None
             try:
-                logger.info("[_compute_shap] Attempting shap.Explainer (auto-detect)")
-                explainer = shap.Explainer(final_estimator, bg_numeric)
+                logger.info("[_compute_shap] Attempting shap.Explainer (auto-detect) with check_additivity=False")
+                explainer = shap.Explainer(final_estimator, bg_numeric, check_additivity=False)
                 shap_values = explainer(input_numeric)
                 expected_value = explainer.expected_value
                 logger.info(f"[_compute_shap] shap.Explainer succeeded: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}")
@@ -764,32 +796,43 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                 logger.warning(f"[_compute_shap] shap.Explainer failed: {e}, falling back to TreeExplainer")
                 # Auto-detect failed, fallback to manual TreeExplainer
                 try:
-                    logger.info("[_compute_shap] Trying shap.TreeExplainer")
-                    explainer = shap.TreeExplainer(final_estimator, bg_numeric)
+                    logger.info("[_compute_shap] Trying shap.TreeExplainer with check_additivity=False")
+                    explainer = shap.TreeExplainer(final_estimator, bg_numeric, check_additivity=False)
                     shap_values = explainer.shap_values(input_numeric)
                     expected_value = explainer.expected_value
                     logger.info(f"[_compute_shap] TreeExplainer succeeded: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}")
                 except Exception as e2:
-                    logger.warning(f"[_compute_shap] TreeExplainer failed: {e2}, falling back to KernelExplainer")
-                    # TreeExplainer failed, fallback to KernelExplainer (slow)
-                    predict_fn = final_estimator.predict_proba if hasattr(final_estimator, 'predict_proba') else final_estimator.predict
+                    logger.warning(f"[_compute_shap] TreeExplainer failed: {e2}, falling back to KernelExplainer on ORIGINAL feature space")
+                    # CRITICAL: Do NOT use KernelExplainer on bg_numeric (1317 features) — too slow.
+                    # Instead, use the FULL PIPELINE as predict_fn and operate on the ORIGINAL feature space.
+                    # This gives SHAP values on the 7 original features, which is much faster.
+                    predict_fn_full = model_obj.predict_proba if hasattr(model_obj, 'predict_proba') else model_obj.predict
 
-                    def _predict_preprocessed(values):
-                        return predict_fn(values)
+                    def _predict_full_pipeline(values):
+                        """Wraps full pipeline predict for SHAP sampling in original feature space."""
+                        if isinstance(values, np.ndarray):
+                            df = pd.DataFrame(values, columns=expected_columns)
+                        else:
+                            df = pd.DataFrame(values, columns=expected_columns)
+                        return predict_fn_full(df)
 
+                    # Use the raw (original) background, capped to 20 rows to keep KernelExplainer fast.
+                    bg_raw_for_kernel = bg_capped.iloc[:20] if len(bg_capped) > 20 else bg_capped
                     np.random.seed(42)
-                    logger.info("[_compute_shap] Using shap.KernelExplainer (this may be slow)")
-                    explainer = shap.KernelExplainer(_predict_preprocessed, bg_numeric)
-                    shap_values = explainer.shap_values(input_numeric)
+                    logger.info(f"[_compute_shap] KernelExplainer on ORIGINAL {len(expected_columns)}-feature space, bg_shape={bg_raw_for_kernel.shape}")
+                    explainer = shap.KernelExplainer(_predict_full_pipeline, bg_raw_for_kernel.values)
+                    shap_values = explainer.shap_values(input_data.values)
                     expected_value = explainer.expected_value
-                    logger.info(f"[_compute_shap] KernelExplainer completed: shap_values type={type(shap_values)}")
+                    # feature names are now the ORIGINAL 7 columns, not the 1317 preprocessed ones
+                    final_feature_names = expected_columns
+                    logger.info(f"[_compute_shap] KernelExplainer (original space) completed: feature_names={len(final_feature_names)}")
 
         else:
             # For non-pipeline models, use shap.Explainer for auto-detection
             logger.info("[_compute_shap] Model is NOT a Pipeline - using model directly")
             try:
-                logger.info("[_compute_shap] Attempting shap.Explainer on raw model")
-                explainer = shap.Explainer(model_obj, input_data)
+                logger.info("[_compute_shap] Attempting shap.Explainer on raw model with check_additivity=False")
+                explainer = shap.Explainer(model_obj, input_data, check_additivity=False)
                 shap_values = explainer(input_data)
                 expected_value = explainer.expected_value
                 logger.info(f"[_compute_shap] shap.Explainer succeeded: shap_values type={type(shap_values)}")
@@ -801,8 +844,8 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                 logger.warning(f"[_compute_shap] shap.Explainer failed: {e}, falling back to TreeExplainer")
                 # Auto-detect failed, fallback to manual TreeExplainer
                 try:
-                    logger.info("[_compute_shap] Trying shap.TreeExplainer on raw model")
-                    explainer = shap.TreeExplainer(model_obj, input_data)
+                    logger.info("[_compute_shap] Trying shap.TreeExplainer on raw model with check_additivity=False")
+                    explainer = shap.TreeExplainer(model_obj, input_data, check_additivity=False)
                     shap_values = explainer.shap_values(input_data)
                     expected_value = explainer.expected_value
                     logger.info(f"[_compute_shap] TreeExplainer succeeded")
@@ -932,9 +975,6 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
     except Exception as e:
         logger.error(f"[_compute_shap] FAILED with exception: {type(e).__name__}: {e}")
         logger.error(f"[_compute_shap] Full traceback:\n{traceback.format_exc()}")
-        raise ValueError(f"SHAP computation failed: {str(e)}")
-
-    except Exception as e:
         raise ValueError(f"SHAP computation failed: {str(e)}")
 
 

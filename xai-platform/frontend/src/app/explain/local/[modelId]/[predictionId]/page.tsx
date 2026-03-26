@@ -110,13 +110,11 @@ export default function UnifiedExplanationPage() {
     enabled: !!modelId && (activeTab === 'shap-bar' || activeTab === 'shap-beeswarm'),
     retry: false,
   });
-
-  // Fetch local SHAP explanation
+  // Fetch local SHAP explanation — always enabled, polls every 5s until data arrives
   const {
     data: localShap,
     isLoading: localShapLoading,
     error: localShapError,
-    refetch: refetchLocalShap,
   } = useQuery<LocalExplanation>({
     queryKey: ['localExplanation', predictionId, 'shap'],
     queryFn: async () => {
@@ -130,16 +128,22 @@ export default function UnifiedExplanationPage() {
         throw error;
       }
     },
-    enabled: !!predictionId && activeTab === 'shap-force',
+    // Always enabled (not gated on activeTab) so polling continues in background
+    enabled: !!predictionId,
     retry: false,
+    // Poll every 5 seconds until explanation data is present
+    refetchInterval: (query) => {
+      const d = query.state.data as LocalExplanation | null | undefined;
+      if (d && d.shap_values && d.shap_values.length > 0) return false; // stop polling
+      return 5000;
+    },
   });
 
-  // Fetch local LIME explanation
+  // Fetch local LIME explanation — always enabled, polls every 5s until data arrives
   const {
     data: localLime,
     isLoading: localLimeLoading,
     error: localLimeError,
-    refetch: refetchLocalLime,
   } = useQuery<LocalExplanation>({
     queryKey: ['localExplanation', predictionId, 'lime'],
     queryFn: async () => {
@@ -153,22 +157,25 @@ export default function UnifiedExplanationPage() {
         throw error;
       }
     },
-    enabled: !!predictionId && activeTab === 'lime',
+    // Always enabled (not gated on activeTab) so polling continues in background
+    enabled: !!predictionId,
     retry: false,
+    // Poll every 5 seconds until lime_weights data is present
+    refetchInterval: (query) => {
+      const d = query.state.data as LocalExplanation | null | undefined;
+      if (d && d.lime_weights && (d.lime_weights as any[]).length > 0) return false; // stop polling
+      return 5000;
+    },
   });
 
   // Mutations to request explanations
+  // (No onSuccess refetch needed — refetchInterval handles continuous polling)
   const requestShapMutation = useMutation({
     mutationFn: async () => {
       const { data } = await api.post(`/explain/local/${modelId}`, null, {
         params: { prediction_id: predictionId },
       });
       return data;
-    },
-    onSuccess: () => {
-      setTimeout(() => {
-        refetchLocalShap();
-      }, 2000);
     },
   });
 
@@ -178,11 +185,6 @@ export default function UnifiedExplanationPage() {
         params: { prediction_id: predictionId },
       });
       return data;
-    },
-    onSuccess: () => {
-      setTimeout(() => {
-        refetchLocalLime();
-      }, 2000);
     },
   });
 
@@ -272,33 +274,25 @@ export default function UnifiedExplanationPage() {
   const isGeneratingGlobal = requestGlobalShapMutation.isPending;
   const globalShapHasData = globalShap && (globalShap.global_importance?.length > 0 || globalShap.shap_values?.length > 0);
 
-  // Auto-trigger SHAP and LIME on page load if not already computed
+  // Auto-trigger SHAP and LIME once on page load if no completed explanation exists.
+  // refetchInterval handles polling; this just ensures computation is kicked off.
   useEffect(() => {
     if (autoTriggered || !predictionId) return;
+    // Only fire once — don't wait for localShap/localLime to load first
+    // (they may not be loaded yet on first render)
+    setAutoTriggered(true);
 
-    // Trigger SHAP if no complete explanation exists
-    const shapComplete = localShap && localShap.shap_values && (!localShap.status || localShap.status === 'complete');
+    const shapComplete = localShap && localShap.shap_values && (localShap.shap_values as number[][]).length > 0;
     if (!shapComplete && !requestShapMutation.isPending) {
       requestShapMutation.mutate();
     }
 
-    // Trigger LIME if no complete explanation exists
-    const limeComplete = localLime && localLime.lime_weights && (!localLime.status || localLime.status === 'complete');
+    const limeComplete = localLime && localLime.lime_weights && (localLime.lime_weights as any[]).length > 0;
     if (!limeComplete && !requestLimeMutation.isPending) {
       requestLimeMutation.mutate();
     }
-
-    setAutoTriggered(true);
-  }, [
-    predictionId,
-    localShap,
-    localLime,
-    requestShapMutation.isPending,
-    requestLimeMutation.isPending,
-    autoTriggered,
-    requestShapMutation,
-    requestLimeMutation,
-  ]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [predictionId]);
 
   if (predictionLoading) {
     return (
@@ -672,6 +666,12 @@ export default function UnifiedExplanationPage() {
               }
 
               const limeWeights = localLime.lime_weights || [];
+              // Debug: log the actual data shape so we can see weights in browser console
+              console.log('[LIME DEBUG] localLime:', localLime);
+              console.log('[LIME DEBUG] lime_weights:', limeWeights);
+              if (limeWeights.length > 0) {
+                console.log('[LIME DEBUG] First item:', JSON.stringify(limeWeights[0]));
+              }
               return (
                 <LIMEPlot
                   key={tab.id}

@@ -236,9 +236,16 @@ async def get_global_explanation(
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
 
+        # Build flexible query to match both string and ObjectId representations of model_id
+        query = {"explanation_type": "global", "method": "shap"}
+        if ObjectId.is_valid(model_id):
+            query["model_id"] = {"$in": [model_id, ObjectId(model_id)]}
+        else:
+            query["model_id"] = model_id
+
         # Find latest global explanation for this model
         explanation = await db.explanations.find_one(
-            {"model_id": model_id, "explanation_type": "global", "method": "shap"},
+            query,
             sort=[("created_at", -1)]
         )
 
@@ -259,10 +266,10 @@ async def get_global_explanation(
 async def request_lime_explanation(
     request: Request,
     model_id: str,
+    prediction_id: str = None,  # optional query param
+    num_features: int = 10,     # query param with default 10
     file: UploadFile = File(None),
     input_data: str = Form(None),
-    prediction_id: str = None,  # optional query param
-    num_features: int = Form(10),
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -461,9 +468,16 @@ async def get_global_lime(
         if not model_doc:
             raise HTTPException(status_code=404, detail="Model not found")
 
+        # Build flexible query to match both string and ObjectId representations of model_id
+        query = {"method": "lime", "explanation_type": "global"}
+        if ObjectId.is_valid(model_id):
+            query["model_id"] = {"$in": [model_id, ObjectId(model_id)]}
+        else:
+            query["model_id"] = model_id
+
         # Find latest global LIME explanation
         explanation = await db.explanations.find_one(
-            {"model_id": model_id, "method": "lime", "explanation_type": "global"},
+            query,
             sort=[("created_at", -1)]
         )
 

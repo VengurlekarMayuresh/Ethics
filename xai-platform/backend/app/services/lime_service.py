@@ -277,18 +277,21 @@ class LIMEService:
             for label, contributions in exp.local_exp.items():
                 # contributions can be either a dict {feature_index: weight} or a list [(feature_index, weight), ...]
                 if isinstance(contributions, dict):
-                    contrib_iterable = contributions.items()
+                    # Convert to list immediately so it can be iterated multiple times
+                    contrib_list = list(contributions.items())
                 elif isinstance(contributions, list):
-                    # Convert list of tuples to (index, weight) pairs
-                    contrib_iterable = contributions
+                    contrib_list = list(contributions)  # make a copy to be safe
                 else:
                     continue
 
-                sorted_contrib = sorted(contrib_iterable, key=lambda x: abs(x[1]), reverse=True)
+                sorted_contrib = sorted(contrib_list, key=lambda x: abs(x[1]), reverse=True)
 
                 feature_weights = []
                 for feature_idx, weight in sorted_contrib[:num_features]:
-                    feature_name = explainer.feature_names[feature_idx]
+                    try:
+                        feature_name = explainer.feature_names[feature_idx]
+                    except (IndexError, KeyError):
+                        feature_name = f"feature_{feature_idx}"
                     # For the value, we need the instance value in the explainer's space.
                     feature_value = instance[feature_idx] if feature_idx < len(instance) else None
                     feature_weights.append({
@@ -297,9 +300,11 @@ class LIMEService:
                         "value": float(feature_value) if feature_value is not None else None
                     })
 
+                # Store ALL contributions in local_exp (not just top-N)
                 explanation_data["local_exp"][str(label)] = [
-                    {"feature": explainer.feature_names[idx], "weight": float(weight)}
-                    for idx, weight in contrib_iterable
+                    {"feature": (explainer.feature_names[idx] if idx < len(explainer.feature_names) else f"feature_{idx}"),
+                     "weight": float(weight)}
+                    for idx, weight in contrib_list
                 ]
                 explanation_data["list_of_contributions"] = feature_weights
 
@@ -375,25 +380,23 @@ class LIMEService:
 
                     explanation_data['local_exp'] = new_local_exp
 
-                    # Update list_of_contributions similarly
-                    if 'list_of_contributions' in explanation_data and explanation_data['list_of_contributions']:
-                        aggregated_contrib2 = defaultdict(float)
-                        for item in explanation_data['list_of_contributions']:
-                            feat_name = item['feature']
-                            try:
-                                idx = list(explainer.feature_names).index(feat_name)
-                            except ValueError:
-                                aggregated_contrib2[feat_name] += abs(item.get('weight', 0))
-                                continue
-                            original = encoded_to_original.get(idx)
-                            if original:
-                                aggregated_contrib2[original] += abs(item.get('weight', 0))
-                            else:
-                                aggregated_contrib2[feat_name] += abs(item.get('weight', 0))
-
+                    # Derive list_of_contributions from the ALREADY AGGREGATED new_local_exp.
+                    # new_local_exp has ALL original features (e.g., 7 original from 1317 preprocessed).
+                    # This is the correct source — the old approach aggregated only the top-N
+                    # preprocessed features, which could miss original features entirely when all
+                    # top-N happen to come from just 1-2 original categorical features.
+                    if new_local_exp:
+                        # Use the first label's aggregated contributions
+                        first_label_data = next(iter(new_local_exp.values()))
+                        # Sort by absolute weight, take top num_features original features
+                        sorted_agg = sorted(
+                            first_label_data,
+                            key=lambda x: abs(x['weight']),
+                            reverse=True
+                        )
                         explanation_data['list_of_contributions'] = [
-                            {"feature": feat, "weight": w, "value": None}
-                            for feat, w in sorted(aggregated_contrib2.items(), key=lambda x: x[1], reverse=True)
+                            {"feature": item['feature'], "weight": item['weight'], "value": None}
+                            for item in sorted_agg[:num_features]
                         ]
 
         return explanation_data
