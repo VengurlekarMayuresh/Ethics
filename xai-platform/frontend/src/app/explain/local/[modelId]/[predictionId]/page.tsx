@@ -605,24 +605,40 @@ export default function UnifiedExplanationPage() {
 
               const baseValue = localShap.expected_value ?? 0;
               const predValue = typeof prediction.prediction === 'number' ? prediction.prediction : 0;
-              const shapValuesArray = Array.isArray(localShap.shap_values) ? localShap.shap_values : [];
-              const firstRow = shapValuesArray[0] || [];
+              const shapValuesRaw = Array.isArray(localShap.shap_values) ? localShap.shap_values : [];
+              // Handle both [[v1,v2,...]] (nested) and [v1,v2,...] (flat) from backend
+              const firstRow: number[] = Array.isArray(shapValuesRaw[0])
+                ? (shapValuesRaw[0] as number[])
+                : (shapValuesRaw as number[]);
               const featureNames = localShap.feature_names || [];
 
-              const shapValuesFormatted = firstRow.map((val, idx) => ({
+              const shapValuesFormatted = firstRow.map((val: number, idx: number) => ({
                 feature: featureNames[idx] || `Feature ${idx}`,
                 value: val,
               }));
 
               return (
-                <SHAPWaterfall
-                  key={tab.id}
-                  shapValues={shapValuesFormatted}
-                  baseValue={baseValue}
-                  prediction={predValue}
-                  title="SHAP Force Plot (Local Explanation)"
-                  height={500}
-                />
+                <div key={tab.id}>
+                  {/* DEBUG PANEL — remove once charts render correctly */}
+                  <div className="mb-4 p-3 bg-yellow-50 border border-yellow-300 rounded text-xs font-mono overflow-auto max-h-48">
+                    <p className="font-bold text-yellow-800 mb-1">🔍 SHAP DEBUG (raw API data):</p>
+                    <p><b>Keys in localShap:</b> {Object.keys(localShap).join(', ')}</p>
+                    <p><b>feature_names ({featureNames.length}):</b> {featureNames.slice(0, 5).join(', ')}{featureNames.length > 5 ? '...' : ''}</p>
+                    <p><b>shap_values type:</b> {Array.isArray(shapValuesRaw) ? `array[${shapValuesRaw.length}]` : typeof shapValuesRaw}</p>
+                    <p><b>shap_values[0] type:</b> {Array.isArray(shapValuesRaw[0]) ? `array[${(shapValuesRaw[0] as any[]).length}]` : typeof shapValuesRaw[0]}</p>
+                    <p><b>firstRow length:</b> {firstRow.length}</p>
+                    <p><b>First 5 values:</b> {firstRow.slice(0, 5).map((v: number) => v?.toFixed(4)).join(', ')}</p>
+                    <p><b>expected_value:</b> {String(localShap.expected_value)}</p>
+                    <p><b>shapValuesFormatted count:</b> {shapValuesFormatted.length}</p>
+                  </div>
+                  <SHAPWaterfall
+                    shapValues={shapValuesFormatted}
+                    baseValue={baseValue}
+                    prediction={predValue}
+                    title="SHAP Force Plot (Local Explanation)"
+                    height={500}
+                  />
+                </div>
               );
 
             case 'lime':
@@ -666,21 +682,31 @@ export default function UnifiedExplanationPage() {
               }
 
               const limeWeights = localLime.lime_weights || [];
-              // Debug: log the actual data shape so we can see weights in browser console
-              console.log('[LIME DEBUG] localLime:', localLime);
-              console.log('[LIME DEBUG] lime_weights:', limeWeights);
-              if (limeWeights.length > 0) {
-                console.log('[LIME DEBUG] First item:', JSON.stringify(limeWeights[0]));
-              }
               return (
-                <LIMEPlot
-                  key={tab.id}
-                  data={limeWeights}
-                  intercept={localLime.lime_intercept}
-                  localPred={localLime.lime_local_pred}
-                  title="LIME Feature Contributions"
-                  height={400}
-                />
+                <div key={tab.id}>
+                  {/* DEBUG PANEL — remove once charts render correctly */}
+                  <div className="mb-4 p-3 bg-yellow-50 border border-yellow-300 rounded text-xs font-mono overflow-auto max-h-48">
+                    <p className="font-bold text-yellow-800 mb-1">🔍 LIME DEBUG (raw API data):</p>
+                    <p><b>Keys in localLime:</b> {Object.keys(localLime).join(', ')}</p>
+                    <p><b>lime_weights type:</b> {Array.isArray(limeWeights) ? `array[${limeWeights.length}]` : typeof limeWeights}</p>
+                    {limeWeights.length > 0 && (
+                      <>
+                        <p><b>First item keys:</b> {Object.keys(limeWeights[0]).join(', ')}</p>
+                        <p><b>First item:</b> {JSON.stringify(limeWeights[0])}</p>
+                        <p><b>Second item:</b> {JSON.stringify(limeWeights[1])}</p>
+                      </>
+                    )}
+                    <p><b>lime_intercept:</b> {String(localLime.lime_intercept)}</p>
+                    <p><b>lime_local_pred:</b> {String(localLime.lime_local_pred)}</p>
+                  </div>
+                  <LIMEPlot
+                    data={limeWeights}
+                    intercept={localLime.lime_intercept}
+                    localPred={localLime.lime_local_pred}
+                    title="LIME Feature Contributions"
+                    height={400}
+                  />
+                </div>
               );
 
             default:

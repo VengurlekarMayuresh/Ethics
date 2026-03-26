@@ -105,103 +105,133 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
         # Get database connection (Celery task needs to establish its own connection)
         import asyncio
         async def async_task():
-            # Reconnect database in worker
-            from app.db.mongo import connect_db
-            await connect_db()
+            try:
+                # Reconnect database in worker
+                from app.db.mongo import connect_db
+                await connect_db()
 
-            db = await get_db()
-            # Get prediction record
-            logger.debug(f"[compute_shap_values] Fetching prediction {prediction_id}")
-            prediction = await db.predictions.find_one({"_id": ObjectId(prediction_id)})
-            if not prediction:
-                raise ValueError(f"Prediction {prediction_id} not found")
+                db = await get_db()
+                # Get prediction record
+                logger.info(f"[compute_shap_values] Fetching prediction {prediction_id}")
+                prediction = await db.predictions.find_one({"_id": ObjectId(prediction_id)})
+                if not prediction:
+                    logger.error(f"[compute_shap_values] Prediction {prediction_id} not found")
+                    raise ValueError(f"Prediction {prediction_id} not found")
 
-            # Get model record
-            logger.debug(f"[compute_shap_values] Fetching model {model_id}")
-            model = await db.models.find_one({"_id": ObjectId(model_id)})
-            if not model:
-                raise ValueError(f"Model {model_id} not found")
+                # Get model record
+                logger.info(f"[compute_shap_values] Fetching model {model_id}")
+                model = await db.models.find_one({"_id": ObjectId(model_id)})
+                if not model:
+                    logger.error(f"[compute_shap_values] Model {model_id} not found")
+                    raise ValueError(f"Model {model_id} not found")
 
-            self.update_state(state="PROGRESS", meta={"status": "loading model file", "progress": 30})
+                # Validate model feature_schema
+                feature_schema = model.get('feature_schema', [])
+                if not feature_schema:
+                    logger.error(f"[compute_shap_values] Model {model_id} has empty feature_schema")
+                    raise ValueError("Model does not have a feature schema. Cannot compute SHAP.")
 
-            # Load model from storage
-            logger.info(f"[compute_shap_values] Loading model from {model['file_path']}")
-            model_obj, framework = await ModelLoaderService.load_model(model["file_path"])
-            logger.info(f"[compute_shap_values] Model loaded: framework={framework}, model_type={type(model_obj).__name__}")
+                logger.info(f"[compute_shap_values] Model feature_schema has {len(feature_schema)} features")
+                expected_features = [fs['name'] for fs in feature_schema]
+                logger.debug(f"[compute_shap_values] Expected features (first 10): {expected_features[:10]}")
 
-            # Prepare input data
-            input_data = pd.DataFrame([prediction["input_data"]])
-            logger.debug(f"[compute_shap_values] Input data shape: {input_data.shape}, columns={list(input_data.columns)}")
+                self.update_state(state="PROGRESS", meta={"status": "loading model file", "progress": 30})
 
-            # Map framework to SHAP explainer type
-            self.update_state(state="PROGRESS", meta={"status": "computing SHAP values", "progress": 50})
+                # Load model from storage
+                logger.info(f"[compute_shap_values] Loading model from {model['file_path']}")
+                model_obj, framework = await ModelLoaderService.load_model(model["file_path"])
+                logger.info(f"[compute_shap_values] Model loaded: framework={framework}, model_type={type(model_obj).__name__}")
 
-            # Load background data if needed for SHAP (e.g. KernelExplainer)
-            background_data = None
-            if model.get("background_data_path"):
-                logger.info(f"[compute_shap_values] Downloading background data from {model['background_data_path']}")
-                bg_bytes = await storage.download_file(model["background_data_path"])
-                background_data = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
-                logger.info(f"[compute_shap_values] Background data loaded: shape={background_data.shape}")
-            else:
-                # Fallback: build background from recent predictions for the same model
-                # to avoid degenerate all-zero SHAP values with single-row background.
-                logger.info(f"[compute_shap_values] No background_data_path, building background from recent predictions")
-                recent_inputs = []
-                model_id_filters = [{"model_id": model_id}]
-                if ObjectId.is_valid(model_id):
-                    model_id_filters.append({"model_id": ObjectId(model_id)})
+                # Prepare input data
+                input_data = pd.DataFrame([prediction["input_data"]])
+                logger.info(f"[compute_shap_values] Input data shape: {input_data.shape}, columns={list(input_data.columns)}")
 
-                cursor = db.predictions.find(
-                    {"$or": model_id_filters},
-                    {"input_data": 1, "_id": 0}
-                ).sort("created_at", -1).limit(200)
+                # Validate input against feature schema
+                expected_features = [fs['name'] for fs in model.get('feature_schema', [])]
+                missing = [f for f in expected_features if f not in input_data.columns]
+                if missing:
+                    logger.error(f"[compute_shap_values] Prediction input missing features: {missing[:5]}")
+                    raise ValueError(f"Prediction input missing required features: {missing[:5]}. Expected: {expected_features[:10]}")
+                # Check for NaN in input
+                if input_data.isna().any().any():
+                    nan_cols = input_data.columns[input_data.isna().any()].tolist()
+                    logger.error(f"[compute_shap_values] Input contains NaN in columns: {nan_cols}")
+                    raise ValueError(f"Prediction input contains NaN values in columns: {nan_cols}. Please provide valid values.")
+                logger.info(f"[compute_shap_values] Input validated against feature schema")
 
-                async for row in cursor:
-                    inp = row.get("input_data")
-                    if isinstance(inp, dict):
-                        recent_inputs.append(inp)
+                # Map framework to SHAP explainer type
+                self.update_state(state="PROGRESS", meta={"status": "computing SHAP values", "progress": 50})
 
-                if len(recent_inputs) >= 2:
-                    background_data = pd.DataFrame(recent_inputs)
-                    # Keep column order aligned with current input.
-                    background_data = background_data.reindex(columns=input_data.columns, fill_value=np.nan)
-                    logger.info(f"[compute_shap_values] Built background from recent predictions: shape={background_data.shape}")
+                # Load background data if needed for SHAP (e.g. KernelExplainer)
+                background_data = None
+                if model.get("background_data_path"):
+                    logger.info(f"[compute_shap_values] Downloading background data from {model['background_data_path']}")
+                    bg_bytes = await storage.download_file(model["background_data_path"])
+                    background_data = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
+                    logger.info(f"[compute_shap_values] Background data loaded: shape={background_data.shape}")
                 else:
-                    logger.warning(f"[compute_shap_values] Not enough recent predictions ({len(recent_inputs)}), will use input_data as background")
+                    # Fallback: build background from recent predictions for the same model
+                    # to avoid degenerate all-zero SHAP values with single-row background.
+                    logger.info(f"[compute_shap_values] No background_data_path, building background from recent predictions")
+                    recent_inputs = []
+                    model_id_filters = [{"model_id": model_id}]
+                    if ObjectId.is_valid(model_id):
+                        model_id_filters.append({"model_id": ObjectId(model_id)})
 
-            logger.info(f"[compute_shap_values] Calling _compute_shap: input_data.shape={input_data.shape}, background_data shape={background_data.shape if background_data is not None else 'None'}")
-            shap_values, expected_value, feature_names = _compute_shap(model_obj, framework, input_data, background_data)
-            logger.info(f"[compute_shap_values] _compute_shap returned: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}, feature_names count={len(feature_names)}")
+                    cursor = db.predictions.find(
+                        {"$or": model_id_filters},
+                        {"input_data": 1, "_id": 0}
+                    ).sort("created_at", -1).limit(200)
 
-            # Normalize SHAP values for frontend (ensure 2D array with one row)
-            shap_values_norm, expected_value_norm = _normalize_shap_local(
-                shap_values, expected_value, prediction.get("prediction"), input_data
-            )
+                    async for row in cursor:
+                        inp = row.get("input_data")
+                        if isinstance(inp, dict):
+                            recent_inputs.append(inp)
 
-            self.update_state(state="PROGRESS", meta={"status": "finalizing", "progress": 90})
+                    if len(recent_inputs) >= 2:
+                        background_data = pd.DataFrame(recent_inputs)
+                        # Keep column order aligned with current input.
+                        background_data = background_data.reindex(columns=input_data.columns, fill_value=np.nan)
+                        logger.info(f"[compute_shap_values] Built background from recent predictions: shape={background_data.shape}")
+                    else:
+                        logger.warning(f"[compute_shap_values] Not enough recent predictions ({len(recent_inputs)}), will use input_data as background")
 
-            # Save explanation to database
-            explanation_doc = {
-                "prediction_id": prediction_id,
-                "model_id": model_id,
-                "method": "shap",
-                "explanation_type": "local",
-                "shap_values": shap_values_norm,
-                "expected_value": expected_value_norm,
-                "feature_names": feature_names,
-                "nl_explanation": None,  # TODO: Add NLG service
-                "task_id": self.request.id,
-                "task_status": "complete",
-                "created_at": datetime.utcnow()
-            }
+                logger.info(f"[compute_shap_values] Calling _compute_shap: input_data.shape={input_data.shape}, background_data shape={background_data.shape if background_data is not None else 'None'}")
+                shap_values, expected_value, feature_names = _compute_shap(model_obj, framework, input_data, background_data)
+                logger.info(f"[compute_shap_values] _compute_shap returned: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}, feature_names count={len(feature_names)}")
 
-            result = await db.explanations.insert_one(explanation_doc)
-            explanation_id = str(result.inserted_id)
+                # Normalize SHAP values for frontend (ensure 2D array with one row)
+                shap_values_norm, expected_value_norm = _normalize_shap_local(
+                    shap_values, expected_value, prediction.get("prediction"), input_data
+                )
 
-            self.update_state(state="SUCCESS", meta={"status": "complete", "explanation_id": explanation_id, "progress": 100})
+                self.update_state(state="PROGRESS", meta={"status": "finalizing", "progress": 90})
 
-            return {"explanation_id": explanation_id, "status": "complete"}
+                # Save explanation to database
+                explanation_doc = {
+                    "prediction_id": prediction_id,
+                    "model_id": model_id,
+                    "method": "shap",
+                    "explanation_type": "local",
+                    "shap_values": shap_values_norm,
+                    "expected_value": expected_value_norm,
+                    "feature_names": feature_names,
+                    "nl_explanation": None,  # TODO: Add NLG service
+                    "task_id": self.request.id,
+                    "task_status": "complete",
+                    "created_at": datetime.utcnow()
+                }
+
+                result = await db.explanations.insert_one(explanation_doc)
+                explanation_id = str(result.inserted_id)
+
+                self.update_state(state="SUCCESS", meta={"status": "complete", "explanation_id": explanation_id, "progress": 100})
+
+                return {"explanation_id": explanation_id, "status": "complete"}
+
+            except Exception as e:
+                logger.error(f"[compute_shap_values] async_task failed: {e}", exc_info=True)
+                raise
 
         return asyncio.run(async_task())
 
@@ -243,7 +273,19 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
                 logger.info(f"[compute_global_shap] Downloading background data from {background_data_path}")
                 bg_bytes = await storage.download_file(background_data_path)
                 background_data = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
-                logger.info(f"[compute_global_shap] Background data loaded: shape={background_data.shape}")
+                logger.info(f"[compute_global_shap] Background data loaded: shape={background_data.shape}, columns={list(background_data.columns)[:10]}")
+                # Validate background data
+                expected_features = [fs['name'] for fs in model.get('feature_schema', [])]
+                missing_features = [f for f in expected_features if f not in background_data.columns]
+                if missing_features:
+                    logger.error(f"[compute_global_shap] Background data missing required features: {missing_features[:5]}")
+                    raise ValueError(f"Background data missing required features: {missing_features[:5]}. Expected: {expected_features[:10]}")
+                # Check for NaN values
+                nan_cols = background_data.columns[background_data.isna().any()].tolist()
+                if nan_cols:
+                    logger.error(f"[compute_global_shap] Background data contains NaN values in columns: {nan_cols[:5]}")
+                    raise ValueError(f"Background data contains NaN values in columns: {nan_cols[:5]}. Please impute or remove missing values.")
+                logger.info(f"[compute_global_shap] Background data validated: all features present, no NaN values")
             else:
                 logger.warning(f"[compute_global_shap] No background_data_path provided")
 
@@ -379,10 +421,10 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
             explanation_id = str(result.inserted_id)
 
             return {"explanation_id": explanation_id, "status": "complete", "feature_importance": feature_importance}
-
         return asyncio.run(async_task())
 
-    except Exception:
+    except Exception as e:
+        logger.error(f"[compute_global_shap] async_task failed: {e}", exc_info=True)
         raise
 
 @celery_app.task(bind=True, name="compute_lime_values")
@@ -466,22 +508,18 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             input_values = input_df.values[0]
             logger.info(f"[compute_lime_values] Input instance shape: {input_values.shape}")
 
-            # For pipelines, preprocess the input instance to match the explainer's feature space
-            instance_to_explain = input_values
+            # For pipelines: do NOT preprocess the instance.
+            # The LIME explainer operates in the ORIGINAL feature space.
+            # We wrap the full pipeline's predict_proba as the prediction function,
+            # so LIME perturbs in original feature space → pipeline handles encoding internally.
+            instance_to_explain = input_values  # always original feature space
+
             if isinstance(model_obj, Pipeline):
-                # Find preprocessor
-                preprocessor = None
-                for step_name, step_obj in model_obj.steps:
-                    if hasattr(step_obj, 'transform'):
-                        preprocessor = step_obj
-                        break
-                if preprocessor is not None:
-                    # Preprocess the input
-                    processed_input = preprocessor.transform(input_df)
-                    if hasattr(processed_input, 'toarray'):
-                        processed_input = processed_input.toarray()
-                    instance_to_explain = np.asarray(processed_input, dtype=float)[0]
-                    logger.info(f"[compute_lime_values] Preprocessed input shape: {instance_to_explain.shape}")
+                logger.info(f"[compute_lime_values] Pipeline detected: LIME will use original {len(input_values)}-feature space with full pipeline predict_proba")
+                # Re-create the explainer using the original training_df (7 features) with
+                # the FULL pipeline as predict_fn — this is already what create_explainer does
+                # when given a Pipeline, so nothing extra needed here.
+                instance_to_explain = input_values  # keep original, no preprocessing
 
             self.update_state(state="PROGRESS", meta={"status": "computing LIME values", "progress": 70})
 

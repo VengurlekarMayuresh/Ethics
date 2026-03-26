@@ -6,8 +6,11 @@ from typing import Dict, Any, List, Optional, Callable
 from app.services.model_loader_service import ModelLoaderService
 import joblib
 import warnings
+import logging
 warnings.filterwarnings('ignore')
 from sklearn.pipeline import Pipeline
+
+logger = logging.getLogger(__name__)
 
 class LIMEService:
     """LIME explainer service for local explanations."""
@@ -47,14 +50,16 @@ class LIMEService:
         """
         Create a LIME tabular explainer for the given model.
 
-        For pipelines, the training data is preprocessed to numeric space before creating the explainer.
-        For non-pipeline models, raw training data is used (must be numeric or have categorical features properly handled).
+        For pipelines, the training data is encoded to numeric codes for LIME (since LIME requires numeric),
+        but the pipeline itself expects raw categorical values. We store category lists to decode later.
+        For non-pipeline models, training data is also encoded to numeric codes; the model is expected
+        to have been trained on numeric data (so no decoding needed).
 
         Args:
             model: The trained model object
             framework: Model framework (sklearn, xgboost, etc.)
-            training_data: Background/training data for LIME (raw or preprocessed)
-            feature_names: Names of features (raw or preprocessed, depending on model type)
+            training_data: Background/training data (raw, may contain strings)
+            feature_names: Names of features (raw feature names)
             mode: "regression" or "classification"
 
         Returns:
@@ -62,104 +67,55 @@ class LIMEService:
         """
         from sklearn.pipeline import Pipeline
 
-        # Check if model is a sklearn Pipeline
-        if isinstance(model, Pipeline):
-            from sklearn.pipeline import Pipeline
-            # Build composite preprocessor from all steps except the final estimator.
-            if len(model.steps) > 1:
-                preprocessor_pipeline = Pipeline(model.steps[:-1])
-            else:
-                preprocessor_pipeline = None
+        # Encode categorical features to numeric codes for LIME (which requires numeric input)
+        training_encoded = training_data.copy()
+        cat_code_maps = {}  # col -> {str_val: code}
+        cat_categories = {}  # col -> list of categories (order = code)
+        categorical_features = []
 
-            if preprocessor_pipeline is not None:
-                # Transform raw training data through full preprocessing chain
-                training_processed = preprocessor_pipeline.transform(training_data)
-                if hasattr(training_processed, 'toarray'):  # sparse matrix
-                    training_processed = training_processed.toarray()
-                training_array = np.asarray(training_processed, dtype=float)
+        for i, col in enumerate(training_encoded.columns):
+            if training_encoded[col].dtype == 'object' or training_encoded[col].dtype.name == 'category':
+                # Convert to pandas Categorical
+                training_encoded[col] = training_encoded[col].astype('category')
+                categories = list(training_encoded[col].cat.categories)
+                cat_categories[col] = categories
+                # Build mapping: string -> code
+                cat_code_maps[col] = {cat: idx for idx, cat in enumerate(categories)}
+                # Replace with numeric codes
+                training_encoded[col] = training_encoded[col].cat.codes.astype(float)
+                categorical_features.append(i)
+            elif len(training_encoded[col].unique()) <= 10 and training_encoded[col].dtype in ['int64', 'int32', 'float64']:
+                categorical_features.append(i)
 
-                # Determine processed feature names from the last step with get_feature_names_out
-                processed_feature_names = None
-                for step_name, step_obj in reversed(preprocessor_pipeline.steps):
-                    if hasattr(step_obj, 'get_feature_names_out'):
-                        try:
-                            if hasattr(step_obj, 'feature_names_in_'):
-                                input_features = step_obj.feature_names_in_
-                                raw_names = step_obj.get_feature_names_out(input_features=input_features)
-                            else:
-                                raw_names = step_obj.get_feature_names_out()
-                            cleaned_names = []
-                            for name in raw_names:
-                                if isinstance(name, bytes):
-                                    name = name.decode('utf-8')
-                                if '__' in name:
-                                    name = name.split('__', 1)[1]
-                                cleaned_names.append(name)
-                            if len(cleaned_names) == training_array.shape[1]:
-                                processed_feature_names = cleaned_names
-                                break
-                        except Exception:
-                            processed_feature_names = None
+        training_array = training_encoded.values.astype(float)
+        if not categorical_features:
+            categorical_features = None
 
-                if processed_feature_names is None or len(processed_feature_names) != training_array.shape[1]:
-                    processed_feature_names = [f"feature_{i}" for i in range(training_array.shape[1])]
-
-                # No categorical features in preprocessed space (all numeric)
-                categorical_features = None
-            else:
-                # No preprocessing steps, use raw data as-is
-                training_array = training_data.values
-                processed_feature_names = feature_names
-                # Auto-detect categorical features
-                categorical_features = []
-                for i, col in enumerate(training_data.columns):
-                    if training_data[col].dtype == 'object' or training_data[col].dtype.name == 'category':
-                        categorical_features.append(i)
-                    elif len(training_data[col].unique()) <= 10 and training_data[col].dtype in ['int64', 'int32']:
-                        categorical_features.append(i)
-                if not categorical_features:
-                    categorical_features = None
-        else:
-            # Non-pipeline: use raw training data
-            training_array = training_data.values
-            processed_feature_names = feature_names
-            # Auto-detect categorical features
-            categorical_features = []
-            for i, col in enumerate(training_data.columns):
-                if training_data[col].dtype == 'object' or training_data[col].dtype.name == 'category':
-                    categorical_features.append(i)
-                elif len(training_data[col].unique()) <= 10 and training_data[col].dtype in ['int64', 'int32']:
-                    categorical_features.append(i)
-            if not categorical_features:
-                categorical_features = None
-
-        # Ensure stable/valid background stats for LIME perturbation sampling.
+        # Ensure stable/valid background stats for LIME perturbation.
         training_array = LIMEService._sanitize_training_array(training_array)
 
-        # Determine if classification and number of classes
-        num_classes = None
-        if mode == "classification":
+        # Determine number of classes for classification mode
+        if mode == "classification" and hasattr(model, 'predict_proba'):
             try:
-                if hasattr(model, 'predict_proba'):
-                    # For sklearn models
-                    # Need to predict on preprocessed data if pipeline
-                    if isinstance(model, Pipeline):
-                        # Predict on preprocessed features
-                        preds = model.predict_proba(training_array)
-                    else:
-                        preds = model.predict_proba(training_data[:min(10, len(training_data))])
-                    if isinstance(preds, list) and len(preds) > 1:
-                        # Multi-class returns list of arrays
-                        num_classes = len(preds)
-                    elif isinstance(preds, np.ndarray) and preds.ndim == 2:
-                        num_classes = preds.shape[1]
-            except:
-                pass
+                if isinstance(model, Pipeline):
+                    # Pipeline expects raw data (with strings)
+                    sample_data = training_data.iloc[:min(10, len(training_data))]
+                else:
+                    # Non-pipeline expects numeric-coded data
+                    sample_data = training_encoded.iloc[:min(10, len(training_encoded))]
+                preds = model.predict_proba(sample_data)
+                # Determine num_classes (not strictly used but could be useful)
+                if isinstance(preds, list) and len(preds) > 1:
+                    num_classes = len(preds)
+                elif isinstance(preds, np.ndarray) and preds.ndim == 2:
+                    num_classes = preds.shape[1]
+            except Exception as e:
+                logger.debug(f"Could not determine num_classes: {e}")
 
         # Create explainer
         explainer = lime.lime_tabular.LimeTabularExplainer(
             training_array,
-            feature_names=processed_feature_names,
+            feature_names=feature_names,
             mode=mode,
             class_names=None,
             kernel_width=3,
@@ -168,6 +124,11 @@ class LIMEService:
             categorical_features=categorical_features,
             verbose=False
         )
+
+        # Store metadata on explainer for later use
+        explainer._cat_code_maps = cat_code_maps
+        explainer._cat_categories = cat_categories
+        explainer._is_pipeline = isinstance(model, Pipeline)
 
         return explainer
 
@@ -197,22 +158,97 @@ class LIMEService:
         # Get feature names from explainer
         feature_names = getattr(explainer, 'feature_names', None)
 
+        # ENCODE INSTANCE if we have categorical mappings stored
+        # The explainer expects numeric codes for categorical features (same as training_array)
+        cat_code_maps = getattr(explainer, '_cat_code_maps', None)
+        if cat_code_maps and feature_names is not None:
+            # instance might be a raw array with strings; convert to encoded numeric
+            instance_encoded = instance.copy()
+            if isinstance(instance, np.ndarray):
+                # For array input, map using feature names
+                for i, col_name in enumerate(feature_names):
+                    if col_name in cat_code_maps and i < len(instance_encoded):
+                        val = instance_encoded[i]
+                        # Convert to string to match mapping keys (handles bytes or other types)
+                        val_str = str(val) if not isinstance(val, str) else val
+                        if val_str in cat_code_maps[col_name]:
+                            instance_encoded[i] = float(cat_code_maps[col_name][val_str])
+                        else:
+                            # Unknown category - use 0 as default
+                            logger.warning(f"Unknown categorical value '{val}' for feature '{col_name}'. Using 0 as default code.")
+                            instance_encoded[i] = 0.0
+            else:
+                # Should be array at this point, but fallback
+                instance_encoded = instance
+            instance_to_use = instance_encoded
+        else:
+            instance_to_use = instance
+
         # Define prediction function based on model type
         from sklearn.pipeline import Pipeline
 
-        if isinstance(model, Pipeline):
-            # For pipelines, the model expects raw input, but the explainer works on preprocessed data.
-            # We need a prediction function that maps preprocessed space back to raw? That's impossible.
-            # Actually, LIME will perturb in the explainer's space (preprocessed). We need to predict on that space.
-            # So we use the final estimator directly.
-            final_estimator = model.steps[-1][1]
+        is_pipeline = getattr(explainer, '_is_pipeline', False)
+        cat_categories = getattr(explainer, '_cat_categories', {}) if is_pipeline else {}
 
-            if hasattr(final_estimator, 'predict_proba'):
-                predict_fn = final_estimator.predict_proba
+        if is_pipeline:
+            # For pipeline models: LIME provides numeric codes; we must decode to raw strings
+            # before passing to the pipeline, which includes its own encoder.
+            if hasattr(model, 'predict_proba'):
+                _pipeline = model
+                def predict_fn(data):
+                    if isinstance(data, np.ndarray):
+                        df = pd.DataFrame(data, columns=feature_names)
+                    else:
+                        df = data.copy()
+                    # Decode categorical columns
+                    if cat_categories:
+                        for col, categories in cat_categories.items():
+                            if col in df.columns:
+                                try:
+                                    # Convert to numeric, round, and clip
+                                    codes = pd.to_numeric(df[col], errors='coerce').round().astype(int)
+                                    # Map codes to category strings
+                                    decoded = []
+                                    for code in codes:
+                                        if pd.isna(code):
+                                            # Use first category if code is missing
+                                            decoded.append(categories[0] if categories else code)
+                                        elif 0 <= code < len(categories):
+                                            decoded.append(categories[code])
+                                        else:
+                                            # Unknown code -> use first category as fallback
+                                            decoded.append(categories[0] if categories else code)
+                                    df[col] = decoded
+                                except Exception as e:
+                                    logger.warning(f"Error decoding column '{col}': {e}")
+                                    # Leave column as-is
+                    return _pipeline.predict_proba(df)
             else:
-                predict_fn = final_estimator.predict
+                _pipeline = model
+                def predict_fn(data):
+                    if isinstance(data, np.ndarray):
+                        df = pd.DataFrame(data, columns=feature_names)
+                    else:
+                        df = data.copy()
+                    if cat_categories:
+                        for col, categories in cat_categories.items():
+                            if col in df.columns:
+                                try:
+                                    codes = pd.to_numeric(df[col], errors='coerce').round().astype(int)
+                                    decoded = []
+                                    for code in codes:
+                                        if pd.isna(code):
+                                            decoded.append(categories[0] if categories else code)
+                                        elif 0 <= code < len(categories):
+                                            decoded.append(categories[code])
+                                        else:
+                                            decoded.append(categories[0] if categories else code)
+                                    df[col] = decoded
+                                except Exception as e:
+                                    logger.warning(f"Error decoding column '{col}': {e}")
+                    return _pipeline.predict(df)
         else:
-            # For non-pipeline models, we may need to handle DataFrames if feature names available
+            # Non-pipeline: model expects numeric input (already encoded)
             if feature_names is not None:
                 def predict_fn(data):
                     if isinstance(data, np.ndarray):
@@ -242,7 +278,7 @@ class LIMEService:
         # Only pass top_labels for classification mode
         if getattr(explainer, 'mode', None) == 'classification':
             explain_kwargs["top_labels"] = 1
-        exp = explainer.explain_instance(instance, predict_fn, **explain_kwargs)
+        exp = explainer.explain_instance(instance_to_use, predict_fn, **explain_kwargs)
 
         # Extract explanation data
         # exp.intercept can be: float, np.ndarray, or dict (for multi-class)
@@ -292,12 +328,20 @@ class LIMEService:
                         feature_name = explainer.feature_names[feature_idx]
                     except (IndexError, KeyError):
                         feature_name = f"feature_{feature_idx}"
-                    # For the value, we need the instance value in the explainer's space.
+                    # For display: safely extract the raw value (may be string or numeric)
                     feature_value = instance[feature_idx] if feature_idx < len(instance) else None
+                    # Safely convert to display value - don't crash on strings (e.g. 'No', 'Female')
+                    if feature_value is None:
+                        display_value = None
+                    else:
+                        try:
+                            display_value = float(feature_value)
+                        except (ValueError, TypeError):
+                            display_value = str(feature_value)  # keep as string for categorical
                     feature_weights.append({
                         "feature": feature_name,
                         "weight": float(weight),
-                        "value": float(feature_value) if feature_value is not None else None
+                        "value": display_value
                     })
 
                 # Store ALL contributions in local_exp (not just top-N)
@@ -308,96 +352,10 @@ class LIMEService:
                 ]
                 explanation_data["list_of_contributions"] = feature_weights
 
-        # ------------------------------------------------------------
-        # AGGREGATION: For pipelines with OneHotEncoder, combine
-        # one-hot encoded features back to original categorical features.
-        # ------------------------------------------------------------
-        if 'local_exp' in explanation_data and explanation_data['local_exp'] and isinstance(model, Pipeline):
-            from collections import defaultdict
-            from sklearn.pipeline import Pipeline
-
-            # Find the ColumnTransformer (feature expander) for mapping encoded features to original categories
-            feature_expander = None
-            for step_name, step_obj in model.steps:
-                if hasattr(step_obj, 'transformers_'):
-                    feature_expander = step_obj
-                    break
-
-            if feature_expander is not None and hasattr(explainer, 'feature_names'):
-                # Build mapping: preprocessed feature index -> original categorical feature name
-                encoded_to_original = {}
-                original_feature_names_set = set()
-
-                # feature_expander has transformers_ attribute
-                for transformer_name, transformer_obj, cols in feature_expander.transformers_:
-                    transformer_class = transformer_obj.__class__.__name__
-
-                    for col in cols:
-                        original_feature_names_set.add(col)
-                        # Match encoded features to original column using normalized names
-                        for idx, fname in enumerate(explainer.feature_names):
-                            if isinstance(fname, bytes):
-                                fname = fname.decode('utf-8')
-                            fname_str = str(fname)
-                            # Normalize: remove transformer prefix if present (e.g., "cat__name_X" -> "name_X")
-                            if '__' in fname_str:
-                                parts = fname_str.split('__', 1)
-                                norm_name = parts[1] if len(parts) == 2 else fname_str
-                            else:
-                                norm_name = fname_str
-                            # Match: exact match for numeric features, or starts with "col_" for one-hot
-                            if norm_name == col or norm_name.startswith(col + '_'):
-                                encoded_to_original[idx] = col
-
-                # Perform aggregation if we have a mapping
-                if encoded_to_original:
-                    new_local_exp = {}
-                    for label_str, contrib_list in explanation_data['local_exp'].items():
-                        aggregated_contrib = defaultdict(float)
-                        # contrib_list: list of {"feature": name, "weight": val}
-                        for item in contrib_list:
-                            feat_name = item['feature']
-                            # Find index of this feature in explainer.feature_names
-                            try:
-                                idx = list(explainer.feature_names).index(feat_name)
-                            except ValueError:
-                                # Can't find - keep as-is
-                                aggregated_contrib[feat_name] += item['weight']
-                                continue
-
-                            original = encoded_to_original.get(idx)
-                            if original:
-                                aggregated_contrib[original] += item['weight']
-                            else:
-                                # Unmapped feature - keep as-is
-                                aggregated_contrib[feat_name] += item['weight']
-
-                        # Sort by absolute weight
-                        new_local_exp[label_str] = [
-                            {"feature": feat, "weight": w}
-                            for feat, w in sorted(aggregated_contrib.items(), key=lambda x: abs(x[1]), reverse=True)
-                        ]
-
-                    explanation_data['local_exp'] = new_local_exp
-
-                    # Derive list_of_contributions from the ALREADY AGGREGATED new_local_exp.
-                    # new_local_exp has ALL original features (e.g., 7 original from 1317 preprocessed).
-                    # This is the correct source — the old approach aggregated only the top-N
-                    # preprocessed features, which could miss original features entirely when all
-                    # top-N happen to come from just 1-2 original categorical features.
-                    if new_local_exp:
-                        # Use the first label's aggregated contributions
-                        first_label_data = next(iter(new_local_exp.values()))
-                        # Sort by absolute weight, take top num_features original features
-                        sorted_agg = sorted(
-                            first_label_data,
-                            key=lambda x: abs(x['weight']),
-                            reverse=True
-                        )
-                        explanation_data['list_of_contributions'] = [
-                            {"feature": item['feature'], "weight": item['weight'], "value": None}
-                            for item in sorted_agg[:num_features]
-                        ]
+        # NOTE: The old aggregation block that mapped 1317 OHE preprocessed features back to
+        # original features has been removed. LIME now operates entirely in the original
+        # feature space (e.g. 7 features) using the full pipeline as predict_fn, so there
+        # are no preprocessed one-hot features to aggregate.
 
         return explanation_data
 
