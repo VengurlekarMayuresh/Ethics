@@ -893,3 +893,127 @@ async def get_shap_dependence(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Natural Language Explanation via OpenRouter
+# ─────────────────────────────────────────────────────────────────────────────
+
+from pydantic import BaseModel
+
+class NLExplanationRequest(BaseModel):
+    prediction_label: Optional[str] = None
+    prediction_value: Optional[float] = None
+    # SHAP data
+    shap_feature_names: Optional[List[str]] = None
+    shap_values: Optional[List[float]] = None       # flat 1D list of float
+    shap_base_value: Optional[float] = None
+    # LIME data
+    lime_weights: Optional[List[Dict[str, Any]]] = None
+    lime_local_pred: Optional[float] = None
+
+
+@router.post("/nl-generate")
+async def generate_nl_explanation(
+    body: NLExplanationRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Generate a natural-language explanation that combines SHAP and LIME results.
+    Uses OpenRouter (GPT-4o-mini) when OPENROUTER_API_KEY is set; otherwise
+    falls back to a deterministic template explanation.
+    """
+    import os
+    import httpx
+
+    # ── Build SHAP contribution summary ──────────────────────────────────────
+    shap_lines: List[str] = []
+    if body.shap_values and body.shap_feature_names:
+        pairs = list(zip(body.shap_feature_names, body.shap_values))
+        top_shap = sorted(pairs, key=lambda x: abs(x[1]), reverse=True)[:7]
+        for fname, fval in top_shap:
+            direction = "↑ increases" if fval > 0 else "↓ decreases"
+            shap_lines.append(f"  • {fname}: SHAP={fval:+.4f}  ({direction} prediction)")
+
+    # ── Build LIME contribution summary ──────────────────────────────────────
+    lime_lines: List[str] = []
+    if body.lime_weights:
+        top_lime = sorted(body.lime_weights, key=lambda x: abs(x.get("weight", 0)), reverse=True)[:7]
+        for item in top_lime:
+            fname = item.get("feature", "?")
+            w = item.get("weight", 0)
+            val = item.get("value", "")
+            val_str = f" (value={val})" if val is not None and val != "" else ""
+            direction = "↑ increases" if w > 0 else "↓ decreases"
+            lime_lines.append(f"  • {fname}{val_str}: weight={w:+.4f}  ({direction} prediction)")
+
+    pred_label = body.prediction_label or "Unknown"
+    pred_val = f"{body.prediction_value:.4f}" if body.prediction_value is not None else "N/A"
+    base_val = f"{body.shap_base_value:.4f}" if body.shap_base_value is not None else "N/A"
+
+    shap_block = "\n".join(shap_lines) if shap_lines else "  (SHAP data not available)"
+    lime_block = "\n".join(lime_lines) if lime_lines else "  (LIME data not available)"
+
+    prompt = f"""You are an AI explainability assistant. A machine learning model made the following prediction:
+
+Prediction: {pred_label}  (score = {pred_val}, base value = {base_val})
+
+SHAP feature contributions (how much each feature pushed the score away from the base value):
+{shap_block}
+
+LIME feature contributions (local linear approximation around this prediction):
+{lime_block}
+
+Write a clear, 4-6 sentence explanation for a non-technical user that:
+1. States what the model predicted and the confidence
+2. Explains the top 3 most influential features and WHY they pushed the prediction in that direction
+3. Notes if SHAP and LIME agree or disagree on the top features
+4. Ends with a one-sentence summary of the overall reasoning
+
+Use plain English. Do not use jargon like "SHAP values" in the final summary — explain the concepts naturally."""
+
+    # ── Try OpenRouter API ────────────────────────────────────────────────────
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if api_key:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://xai-platform",
+                        "X-Title": "XAI Platform",
+                    },
+                    json={
+                        "model": "stepfun/step-3.5-flash:free",
+                        "messages": [
+                            {"role": "system", "content": "You are an AI explainability expert. Give clear, concise explanations."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        "temperature": 0.4,
+                        "max_tokens": 400,
+                    }
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"].strip()
+                return {"explanation": text, "source": "openrouter"}
+        except Exception as e:
+            # Fall through to template
+            pass
+
+    # ── Template fallback ─────────────────────────────────────────────────────
+    top_shap_name = body.shap_feature_names[0] if body.shap_feature_names else "an unknown feature"
+    top_lime_name = body.lime_weights[0]["feature"] if body.lime_weights else "an unknown feature"
+
+    template = (
+        f"The model predicted **{pred_label}** with a score of {pred_val} "
+        f"(baseline average: {base_val}).\n\n"
+        f"According to SHAP analysis, **{top_shap_name}** had the largest influence on this prediction. "
+        f"LIME's local analysis also identifies **{top_lime_name}** as a key driver. "
+        f"Features with positive contributions pushed the score higher, while negative ones pulled it lower. "
+        f"Overall, the model's decision for this instance was most heavily shaped by the top features listed above."
+    )
+    return {"explanation": template, "source": "template"}
+

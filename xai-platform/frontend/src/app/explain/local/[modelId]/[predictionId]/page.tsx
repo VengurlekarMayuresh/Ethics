@@ -15,11 +15,10 @@ import {
   Upload,
 } from 'lucide-react';
 import Link from 'next/link';
-import FeatureImportanceBar from '@/components/charts/FeatureImportanceBar';
-import SHAPBeeswarm from '@/components/charts/SHAPBeeswarm';
 import SHAPForcePlot from '@/components/charts/SHAPForcePlot';
 import LIMEPlot from '@/components/charts/LIMEPlot';
 import { format } from 'date-fns';
+import ReactMarkdown from 'react-markdown';
 
 interface Prediction {
   _id: string;
@@ -56,7 +55,164 @@ interface LocalExplanation {
   error?: string;
 }
 
-type TabId = 'shap-bar' | 'shap-beeswarm' | 'shap-force' | 'lime';
+type TabId = 'shap-force' | 'lime' | 'explanation';
+
+// ─── ExplanationTab ──────────────────────────────────────────────────────────
+function ExplanationTab({
+  localShap, localLime, predictionValue, predictionLabel, explanationReady,
+}: {
+  localShap: any; localLime: any; predictionValue: number; predictionLabel: string; explanationReady: boolean;
+}) {
+  const [nlText, setNlText] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [source, setSource] = useState<'openrouter' | 'template' | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const generate = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      // Build flat SHAP values
+      let shapValues: number[] | undefined;
+      let shapFeatureNames: string[] | undefined;
+      if (localShap?.shap_values && localShap.feature_names) {
+        const raw: number[][] | number[] = localShap.shap_values;
+        shapValues = Array.isArray(raw[0]) ? (raw[0] as number[]) : (raw as number[]);
+        shapFeatureNames = localShap.feature_names;
+      }
+      const payload = {
+        prediction_label: predictionLabel,
+        prediction_value: predictionValue,
+        shap_feature_names: shapFeatureNames,
+        shap_values: shapValues,
+        shap_base_value: localShap?.expected_value ?? undefined,
+        lime_weights: localLime?.lime_weights ?? undefined,
+        lime_local_pred: localLime?.lime_local_pred ?? undefined,
+      };
+      const { data } = await api.post('/explain/nl-generate', payload);
+      setNlText(data.explanation);
+      setSource(data.source);
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || 'Failed to generate explanation.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!explanationReady) {
+    return (
+      <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+        <FileText className="mx-auto h-16 w-16 text-gray-400" />
+        <h3 className="mt-4 text-xl font-semibold text-gray-900">AI Explanation</h3>
+        <p className="mt-2 text-gray-600 max-w-lg mx-auto">
+          Generate SHAP and/or LIME explanations first, then come back here for a plain-English interpretation.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header card */}
+      <div className="rounded-xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-purple-50 p-6">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-bold text-indigo-900">AI-Powered Explanation</h2>
+            <p className="mt-1 text-sm text-indigo-700">
+              A plain-English interpretation of SHAP and LIME results for this prediction.
+            </p>
+          </div>
+          <button
+            onClick={generate}
+            disabled={loading}
+            className="flex-shrink-0 inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-60 transition"
+          >
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+            {loading ? 'Generating...' : nlText ? 'Regenerate' : 'Generate Explanation'}
+          </button>
+        </div>
+
+        {/* Data availability badges */}
+        <div className="flex gap-3 mt-4">
+          {localShap?.shap_values ? (
+            <span className="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-full bg-green-100 text-green-800">
+              <CheckCircle className="h-3 w-3" /> SHAP ready
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-full bg-gray-100 text-gray-500">
+              SHAP not available
+            </span>
+          )}
+          {localLime?.lime_weights?.length ? (
+            <span className="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-full bg-purple-100 text-purple-800">
+              <CheckCircle className="h-3 w-3" /> LIME ready
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-full bg-gray-100 text-gray-500">
+              LIME not available
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Error */}
+      {error && (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700 flex items-center gap-2">
+          <AlertCircle className="h-4 w-4 flex-shrink-0" />
+          {error}
+        </div>
+      )}
+
+      {/* Loading */}
+      {loading && (
+        <div className="flex items-center justify-center py-16">
+          <div className="text-center">
+            <Loader2 className="mx-auto h-10 w-10 animate-spin text-indigo-500" />
+            <p className="mt-3 text-gray-600 font-medium">Analyzing predictions...</p>
+            <p className="text-sm text-gray-500">This usually takes a few seconds.</p>
+          </div>
+        </div>
+      )}
+
+      {/* Result */}
+      {nlText && !loading && (
+        <div className="rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-semibold text-gray-900 flex items-center gap-2">
+              <Brain className="h-5 w-5 text-indigo-500" />
+              Explanation
+            </h3>
+            {source && (
+              <span className={`text-xs px-2 py-1 rounded-full font-medium ${
+                source === 'openrouter'
+                  ? 'bg-green-100 text-green-700'
+                  : 'bg-yellow-100 text-yellow-700'
+              }`}>
+                {source === 'openrouter' ? '✨ AI Generated' : '📋 Template'}
+              </span>
+            )}
+          </div>
+          <div className="prose prose-sm max-w-none text-gray-800 leading-relaxed">
+            <ReactMarkdown>{nlText}</ReactMarkdown>
+          </div>
+        </div>
+      )}
+
+      {/* Prompt to generate */}
+      {!nlText && !loading && !error && (
+        <div className="flex items-center justify-center py-12 border-2 border-dashed border-gray-200 rounded-xl text-gray-500">
+          <div className="text-center">
+            <FileText className="mx-auto h-10 w-10 text-gray-300 mb-3" />
+            <p className="font-medium">Click "Generate Explanation" to get started</p>
+            <p className="text-sm mt-1">SHAP + LIME data will be sent to the AI for interpretation</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default function UnifiedExplanationPage() {
   const params = useParams();
@@ -87,7 +243,6 @@ export default function UnifiedExplanationPage() {
     enabled: !!predictionId,
   });
 
-  // Fetch global SHAP explanation
   const {
     data: globalShap,
     isLoading: globalShapLoading,
@@ -100,14 +255,11 @@ export default function UnifiedExplanationPage() {
         const { data } = await api.get(`/explain/global/${modelId}/latest`);
         return data;
       } catch (error: any) {
-        if (error.response?.status === 404) {
-          // No global SHAP yet – treat as not-found, not an error
-          return null;
-        }
+        if (error.response?.status === 404) return null;
         throw error;
       }
     },
-    enabled: !!modelId && (activeTab === 'shap-bar' || activeTab === 'shap-beeswarm'),
+    enabled: false,
     retry: false,
   });
   // Fetch local SHAP explanation — always enabled, polls every 5s until data arrives
@@ -225,17 +377,13 @@ export default function UnifiedExplanationPage() {
   };
 
   const tabs = [
-    { id: 'shap-bar' as TabId, label: 'SHAP Summary Bar', icon: BarChart3 },
-    { id: 'shap-beeswarm' as TabId, label: 'SHAP Beeswarm', icon: BarChart3 },
-    { id: 'shap-force' as TabId, label: 'SHAP Force', icon: BarChart3 },
+    { id: 'shap-force' as TabId, label: 'SHAP Force Plot', icon: BarChart3 },
     { id: 'lime' as TabId, label: 'LIME', icon: Brain },
+    { id: 'explanation' as TabId, label: 'AI Explanation', icon: FileText },
   ];
 
   const isTabLoading = (tab: TabId) => {
     switch (tab) {
-      case 'shap-bar':
-      case 'shap-beeswarm':
-        return globalShapLoading;
       case 'shap-force':
         return localShapLoading || localShap?.status === 'pending';
       case 'lime':
@@ -247,27 +395,17 @@ export default function UnifiedExplanationPage() {
 
   const getTabData = (tab: TabId) => {
     switch (tab) {
-      case 'shap-bar':
-      case 'shap-beeswarm':
-        return globalShap;
-      case 'shap-force':
-        return localShap;
-      case 'lime':
-        return localLime;
+      case 'shap-force': return localShap;
+      case 'lime': return localLime;
+      default: return null;
     }
   };
 
   const getTabError = (tab: TabId) => {
     switch (tab) {
-      case 'shap-bar':
-      case 'shap-beeswarm':
-        return globalShapError;
-      case 'shap-force':
-        return localShapError;
-      case 'lime':
-        return localLimeError;
-      default:
-        return null;
+      case 'shap-force': return localShapError;
+      case 'lime': return localLimeError;
+      default: return null;
     }
   };
 
@@ -619,18 +757,6 @@ export default function UnifiedExplanationPage() {
 
               return (
                 <div key={tab.id}>
-                  {/* DEBUG PANEL — remove once charts render correctly */}
-                  <div className="mb-4 p-3 bg-yellow-50 border border-yellow-300 rounded text-xs font-mono overflow-auto max-h-48">
-                    <p className="font-bold text-yellow-800 mb-1">🔍 SHAP DEBUG (raw API data):</p>
-                    <p><b>Keys in localShap:</b> {Object.keys(localShap).join(', ')}</p>
-                    <p><b>feature_names ({featureNames.length}):</b> {featureNames.slice(0, 5).join(', ')}{featureNames.length > 5 ? '...' : ''}</p>
-                    <p><b>shap_values type:</b> {Array.isArray(shapValuesRaw) ? `array[${shapValuesRaw.length}]` : typeof shapValuesRaw}</p>
-                    <p><b>shap_values[0] type:</b> {Array.isArray(shapValuesRaw[0]) ? `array[${(shapValuesRaw[0] as any[]).length}]` : typeof shapValuesRaw[0]}</p>
-                    <p><b>firstRow length:</b> {firstRow.length}</p>
-                    <p><b>First 5 values:</b> {firstRow.slice(0, 5).map((v: number) => v?.toFixed(4)).join(', ')}</p>
-                    <p><b>expected_value:</b> {String(localShap.expected_value)}</p>
-                    <p><b>shapValuesFormatted count:</b> {shapValuesFormatted.length}</p>
-                  </div>
                   <SHAPForcePlot
                     shapValues={shapValuesFormatted}
                     baseValue={baseValue}
@@ -683,21 +809,6 @@ export default function UnifiedExplanationPage() {
               const limeWeights = localLime.lime_weights || [];
               return (
                 <div key={tab.id}>
-                  {/* DEBUG PANEL — remove once charts render correctly */}
-                  <div className="mb-4 p-3 bg-yellow-50 border border-yellow-300 rounded text-xs font-mono overflow-auto max-h-48">
-                    <p className="font-bold text-yellow-800 mb-1">🔍 LIME DEBUG (raw API data):</p>
-                    <p><b>Keys in localLime:</b> {Object.keys(localLime).join(', ')}</p>
-                    <p><b>lime_weights type:</b> {Array.isArray(limeWeights) ? `array[${limeWeights.length}]` : typeof limeWeights}</p>
-                    {limeWeights.length > 0 && (
-                      <>
-                        <p><b>First item keys:</b> {Object.keys(limeWeights[0]).join(', ')}</p>
-                        <p><b>First item:</b> {JSON.stringify(limeWeights[0])}</p>
-                        <p><b>Second item:</b> {JSON.stringify(limeWeights[1])}</p>
-                      </>
-                    )}
-                    <p><b>lime_intercept:</b> {String(localLime.lime_intercept)}</p>
-                    <p><b>lime_local_pred:</b> {String(localLime.lime_local_pred)}</p>
-                  </div>
                   <LIMEPlot
                     data={limeWeights}
                     intercept={localLime.lime_intercept}
@@ -707,6 +818,24 @@ export default function UnifiedExplanationPage() {
                   />
                 </div>
               );
+
+            case 'explanation': {
+              // Gather SHAP data
+              const hasShap = !!(localShap?.shap_values && localShap.feature_names);
+              const hasLime = !!(localLime?.lime_weights && (localLime.lime_weights as any[]).length > 0);
+              const explanationReady = hasShap || hasLime;
+
+              return (
+                <ExplanationTab
+                  key={tab.id}
+                  localShap={localShap}
+                  localLime={localLime}
+                  predictionValue={typeof prediction.prediction === 'number' ? prediction.prediction : 0}
+                  predictionLabel={String(prediction.prediction)}
+                  explanationReady={explanationReady}
+                />
+              );
+            }
 
             default:
               return null;

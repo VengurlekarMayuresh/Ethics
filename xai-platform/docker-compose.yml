@@ -17,6 +17,7 @@ services:
       - JWT_ALGORITHM=HS256
       - ACCESS_TOKEN_EXPIRE_MINUTES=15
       - REFRESH_TOKEN_EXPIRE_DAYS=7
+      - OPENROUTER_API_KEY=your-openrouter-key-here
     depends_on:
       - mongo
       - redis
@@ -48,6 +49,7 @@ services:
       - MINIO_SECRET_KEY=minioadmin
       - MINIO_BUCKET=xai-models
       - JWT_SECRET=super-secret-jwt-key-change-in-production
+      - OPENROUTER_API_KEY=your-openrouter-key-here
     depends_on:
       - redis
       - mongo
