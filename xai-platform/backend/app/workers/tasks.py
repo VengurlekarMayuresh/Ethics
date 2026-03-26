@@ -2,6 +2,7 @@ import shap
 import numpy as np
 import pandas as pd
 import os
+import logging
 from typing import Dict, Any, List, Optional
 from app.workers.celery_app import celery_app
 from app.services.model_loader_service import ModelLoaderService
@@ -13,11 +14,22 @@ from bson import ObjectId
 import pickle
 import joblib
 from sklearn.pipeline import Pipeline
+import traceback
 
 # Maximum number of background samples to use for global SHAP/LIME explanations
 # Prevents extremely long computation times with large datasets
 MAX_GLOBAL_SHAP_SAMPLES = int(os.getenv("MAX_GLOBAL_SHAP_SAMPLES", "200"))
 import re
+
+# Configure logger
+logger = logging.getLogger(__name__)
+# Ensure logger outputs to console if no handlers configured
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)  # Default to INFO; can be overridden by env var LOGLEVEL
 
 def _align_background_data(background_df: pd.DataFrame, model_doc: dict) -> pd.DataFrame:
     """
@@ -87,6 +99,7 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
     This can be expensive for large datasets, so it's run in background.
     """
     try:
+        logger.info(f"[compute_shap_values] START: prediction_id={prediction_id}, model_id={model_id}")
         self.update_state(state="PROGRESS", meta={"status": "loading model", "progress": 10})
 
         # Get database connection (Celery task needs to establish its own connection)
@@ -98,11 +111,13 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
 
             db = await get_db()
             # Get prediction record
+            logger.debug(f"[compute_shap_values] Fetching prediction {prediction_id}")
             prediction = await db.predictions.find_one({"_id": ObjectId(prediction_id)})
             if not prediction:
                 raise ValueError(f"Prediction {prediction_id} not found")
 
             # Get model record
+            logger.debug(f"[compute_shap_values] Fetching model {model_id}")
             model = await db.models.find_one({"_id": ObjectId(model_id)})
             if not model:
                 raise ValueError(f"Model {model_id} not found")
@@ -110,10 +125,13 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
             self.update_state(state="PROGRESS", meta={"status": "loading model file", "progress": 30})
 
             # Load model from storage
+            logger.info(f"[compute_shap_values] Loading model from {model['file_path']}")
             model_obj, framework = await ModelLoaderService.load_model(model["file_path"])
+            logger.info(f"[compute_shap_values] Model loaded: framework={framework}, model_type={type(model_obj).__name__}")
 
             # Prepare input data
             input_data = pd.DataFrame([prediction["input_data"]])
+            logger.debug(f"[compute_shap_values] Input data shape: {input_data.shape}, columns={list(input_data.columns)}")
 
             # Map framework to SHAP explainer type
             self.update_state(state="PROGRESS", meta={"status": "computing SHAP values", "progress": 50})
@@ -121,11 +139,14 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
             # Load background data if needed for SHAP (e.g. KernelExplainer)
             background_data = None
             if model.get("background_data_path"):
+                logger.info(f"[compute_shap_values] Downloading background data from {model['background_data_path']}")
                 bg_bytes = await storage.download_file(model["background_data_path"])
                 background_data = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
+                logger.info(f"[compute_shap_values] Background data loaded: shape={background_data.shape}")
             else:
                 # Fallback: build background from recent predictions for the same model
                 # to avoid degenerate all-zero SHAP values with single-row background.
+                logger.info(f"[compute_shap_values] No background_data_path, building background from recent predictions")
                 recent_inputs = []
                 model_id_filters = [{"model_id": model_id}]
                 if ObjectId.is_valid(model_id):
@@ -145,8 +166,13 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
                     background_data = pd.DataFrame(recent_inputs)
                     # Keep column order aligned with current input.
                     background_data = background_data.reindex(columns=input_data.columns, fill_value=np.nan)
+                    logger.info(f"[compute_shap_values] Built background from recent predictions: shape={background_data.shape}")
+                else:
+                    logger.warning(f"[compute_shap_values] Not enough recent predictions ({len(recent_inputs)}), will use input_data as background")
 
+            logger.info(f"[compute_shap_values] Calling _compute_shap: input_data.shape={input_data.shape}, background_data shape={background_data.shape if background_data is not None else 'None'}")
             shap_values, expected_value, feature_names = _compute_shap(model_obj, framework, input_data, background_data)
+            logger.info(f"[compute_shap_values] _compute_shap returned: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}, feature_names count={len(feature_names)}")
 
             # Normalize SHAP values for frontend (ensure 2D array with one row)
             shap_values_norm, expected_value_norm = _normalize_shap_local(
@@ -188,6 +214,7 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
     Async task to compute global SHAP values across a dataset.
     """
     try:
+        logger.info(f"[compute_global_shap] START: model_id={model_id}, background_data_path={background_data_path}")
         self.update_state(state="PROGRESS", meta={"status": "loading model", "progress": 10})
 
         import asyncio
@@ -198,6 +225,7 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
             db = await get_db()
 
             # Get model record
+            logger.debug(f"[compute_global_shap] Fetching model {model_id}")
             model = await db.models.find_one({"_id": ObjectId(model_id)})
             if not model:
                 raise ValueError(f"Model {model_id} not found")
@@ -205,13 +233,19 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
             self.update_state(state="PROGRESS", meta={"status": "loading model file", "progress": 30})
 
             # Load model
+            logger.info(f"[compute_global_shap] Loading model from {model['file_path']}")
             model_obj, framework = await ModelLoaderService.load_model(model["file_path"])
+            logger.info(f"[compute_global_shap] Model loaded: framework={framework}, model_type={type(model_obj).__name__}")
 
             # Load background data (provided by user)
             background_data = None
             if background_data_path:
+                logger.info(f"[compute_global_shap] Downloading background data from {background_data_path}")
                 bg_bytes = await storage.download_file(background_data_path)
                 background_data = pd.read_csv(pd.io.common.BytesIO(bg_bytes))
+                logger.info(f"[compute_global_shap] Background data loaded: shape={background_data.shape}")
+            else:
+                logger.warning(f"[compute_global_shap] No background_data_path provided")
 
             self.update_state(state="PROGRESS", meta={"status": "computing global SHAP", "progress": 50})
 
@@ -222,7 +256,9 @@ def compute_global_shap(self, model_id: str, background_data_path: Optional[str]
                 # If no background data, sample from model's training data if available
                 raise ValueError("Background data is required for global SHAP computation")
 
+            logger.info(f"[compute_global_shap] Calling _compute_shap: input_data.shape={input_data.shape}")
             shap_values, expected_value, feature_names = _compute_shap(model_obj, framework, input_data, background_data)
+            logger.info(f"[compute_global_shap] _compute_shap returned: shap_values type={type(shap_values)}, feature_names count={len(feature_names)}")
 
             self.update_state(state="PROGRESS", meta={"status": "calculating feature importance", "progress": 80})
 
@@ -551,13 +587,18 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
 
     try:
         expected_columns = list(input_data.columns)
+        logger.info(f"[_compute_shap] START: framework={framework}, input_data.shape={input_data.shape}")
+        logger.debug(f"[_compute_shap] Expected columns (first 10): {expected_columns[:10]}")
+        logger.debug(f"[_compute_shap] Expected columns types: {[type(c).__name__ for c in expected_columns[:10]]}")
 
         def _prepare_background(df: Optional[pd.DataFrame]) -> pd.DataFrame:
             """Ensure SHAP background data matches model input columns, tolerating name-style mismatches."""
             if df is None or len(df) == 0:
+                logger.info(f"[_compute_shap] No background data provided, using input_data as background")
                 return input_data[expected_columns]
 
             bg_df = df.copy()
+            logger.debug(f"[_compute_shap] _prepare_background: input bg_df.shape={bg_df.shape}, columns={list(bg_df.columns)[:10]}")
 
             def _norm(name: Any) -> str:
                 # Normalize aggressively to handle case, spaces, dashes, punctuation, BOM-like noise.
@@ -585,6 +626,7 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
             if missing:
                 # Safe fallback: synthesize missing columns from the current input row
                 # rather than mapping by position (which can mis-map IDs/text fields).
+                logger.debug(f"[_compute_shap] Missing columns: {missing[:5]}, synthesizing from input row")
                 input_row = input_data.iloc[0].to_dict()
                 for col in missing:
                     if col in input_row:
@@ -600,15 +642,20 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
 
             # Rename resolved columns to expected names, drop extras, and keep input order.
             selected_actual_cols = [resolved[c] for c in expected_columns]
+            logger.debug(f"[_compute_shap] selected_actual_cols (first 5): {selected_actual_cols[:5]}")
+            logger.debug(f"[_compute_shap] selected_actual_cols types: {[type(c).__name__ for c in selected_actual_cols[:5]]}")
             bg_df = bg_df[selected_actual_cols].copy()
             bg_df.columns = expected_columns
+            logger.debug(f"[_compute_shap] _prepare_background: output bg_df.shape={bg_df.shape}")
             return bg_df
 
         # Initialize with input data columns as default feature names
         final_feature_names = expected_columns
+        logger.info(f"[_compute_shap] Expected columns count: {len(expected_columns)}")
 
         # Check if model is a sklearn Pipeline
         if isinstance(model_obj, Pipeline):
+            logger.info("[_compute_shap] Model is a Pipeline - preprocessing required")
             # For pipelines, we need to work in the preprocessed feature space
             # because the model expects numeric inputs after preprocessing.
 
@@ -618,14 +665,17 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                 if hasattr(step_obj, 'transform'):
                     preprocessor = step_obj
                     break
+            logger.info(f"[_compute_shap] Found preprocessor: {type(preprocessor).__name__ if preprocessor else 'None'}")
 
             # Get the final estimator for prediction
             final_estimator = model_obj.steps[-1][1]
+            logger.info(f"[_compute_shap] Final estimator: {type(final_estimator).__name__}")
 
             # Determine final_feature_names from preprocessor (if available)
             # This is needed for aggregating one-hot encoded features later.
             final_feature_names = expected_columns  # default fallback
             if preprocessor is not None and hasattr(preprocessor, 'get_feature_names_out'):
+                logger.debug("[_compute_shap] Attempting to get feature names from preprocessor")
                 try:
                     raw_names = preprocessor.get_feature_names_out()
                     cleaned_names = []
@@ -636,92 +686,147 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                             name = name.split('__', 1)[1]
                         cleaned_names.append(name)
                     final_feature_names = cleaned_names
-                except Exception:
+                    logger.info(f"[_compute_shap] Extracted {len(final_feature_names)} feature names from preprocessor")
+                    logger.debug(f"[_compute_shap] First 10 final_feature_names: {final_feature_names[:10]}")
+                except Exception as e:
+                    logger.warning(f"[_compute_shap] Failed to get feature names from preprocessor: {e}")
                     pass  # keep default
 
             # Prepare background data (raw) - align columns, use FULL background if available
             if background_data is not None and len(background_data) > 0:
+                logger.info(f"[_compute_shap] Preparing background data: shape={background_data.shape}")
                 bg = _prepare_background(background_data)  # use full dataset
             else:
+                logger.info("[_compute_shap] No background data provided, using input_data as background")
                 bg = _prepare_background(input_data)
+            logger.info(f"[_compute_shap] Background data prepared: shape={bg.shape}")
 
             # --------------------------------------------------------
-            # Try TreeExplainer first - FAST for tree-based models
+            # For pipelines, we must preprocess data and use final estimator
+            # Try TreeExplainer first if final estimator is tree-based (FAST)
             # --------------------------------------------------------
+            # Preprocess background data
+            if len(bg) > MAX_GLOBAL_SHAP_SAMPLES:
+                # For large datasets, sample to avoid memory issues with KernelExplainer
+                logger.info(f"[_compute_shap] Background data size ({len(bg)}) exceeds MAX_GLOBAL_SHAP_SAMPLES ({MAX_GLOBAL_SHAP_SAMPLES}), sampling")
+                bg_capped = bg.sample(n=MAX_GLOBAL_SHAP_SAMPLES, random_state=42)
+            else:
+                bg_capped = bg
+            logger.info(f"[_compute_shap] Background data after capping: shape={bg_capped.shape}")
+
+            # Preprocess to numeric space
+            if preprocessor is not None:
+                logger.debug("[_compute_shap] Transforming background data with preprocessor")
+                bg_processed = preprocessor.transform(bg_capped)
+                if hasattr(bg_processed, 'toarray'):  # sparse matrix
+                    bg_processed = bg_processed.toarray()
+                bg_numeric = np.asarray(bg_processed, dtype=float)
+            else:
+                logger.debug("[_compute_shap] No preprocessor, converting background to numeric via .values")
+                bg_numeric = bg_capped.values.astype(float)
+            logger.info(f"[_compute_shap] Background numeric shape: {bg_numeric.shape}, dtype={bg_numeric.dtype}")
+            logger.debug(f"[_compute_shap] Background numeric sample (first row, first 5): {bg_numeric[0, :5] if bg_numeric.shape[0] > 0 else 'empty'}")
+
+            # Preprocess full input data
+            if preprocessor is not None:
+                logger.debug(f"[_compute_shap] Transforming input data ({input_data.shape}) with preprocessor")
+                input_processed = preprocessor.transform(input_data)
+                if hasattr(input_processed, 'toarray'):
+                    input_processed = input_processed.toarray()
+                input_numeric = np.asarray(input_processed, dtype=float)
+            else:
+                logger.debug("[_compute_shap] No preprocessor, converting input to numeric via .values")
+                input_numeric = input_data.values.astype(float)
+            logger.info(f"[_compute_shap] Input numeric shape: {input_numeric.shape}, dtype={input_numeric.dtype}")
+
+            # Use shap.Explainer for auto-detection of optimal explainer
+            # This automatically picks LinearExplainer, TreeExplainer, or KernelExplainer
+            shap_values = None
+            expected_value = None
             try:
-                # TreeExplainer can work directly with the pipeline and raw background
-                explainer = shap.TreeExplainer(model_obj, bg)
-                shap_values = explainer.shap_values(input_data)
+                logger.info("[_compute_shap] Attempting shap.Explainer (auto-detect)")
+                explainer = shap.Explainer(final_estimator, bg_numeric)
+                shap_values = explainer(input_numeric)
                 expected_value = explainer.expected_value
-            except Exception:
-                # TreeExplainer failed or not supported; fallback to KernelExplainer
-                # For KernelExplainer we must limit background size to avoid freeze
-                if len(bg) > MAX_GLOBAL_SHAP_SAMPLES:
-                    bg_capped = bg.sample(n=MAX_GLOBAL_SHAP_SAMPLES, random_state=42)
-                else:
-                    bg_capped = bg
+                logger.info(f"[_compute_shap] shap.Explainer succeeded: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}")
+                # Convert shap.Explanation to raw array if needed
+                if hasattr(shap_values, 'values'):
+                    shap_values = shap_values.values
+                    logger.debug(f"[_compute_shap] Converted shap.Explanation to values array: shape={shap_values.shape if hasattr(shap_values, 'shape') else 'N/A'}")
+            except Exception as e:
+                logger.warning(f"[_compute_shap] shap.Explainer failed: {e}, falling back to TreeExplainer")
+                # Auto-detect failed, fallback to manual TreeExplainer
+                try:
+                    logger.info("[_compute_shap] Trying shap.TreeExplainer")
+                    explainer = shap.TreeExplainer(final_estimator, bg_numeric)
+                    shap_values = explainer.shap_values(input_numeric)
+                    expected_value = explainer.expected_value
+                    logger.info(f"[_compute_shap] TreeExplainer succeeded: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}")
+                except Exception as e2:
+                    logger.warning(f"[_compute_shap] TreeExplainer failed: {e2}, falling back to KernelExplainer")
+                    # TreeExplainer failed, fallback to KernelExplainer (slow)
+                    predict_fn = final_estimator.predict_proba if hasattr(final_estimator, 'predict_proba') else final_estimator.predict
 
-                # Preprocess the capped background to numeric space
-                if preprocessor is not None:
-                    bg_processed = preprocessor.transform(bg_capped)
-                    if hasattr(bg_processed, 'toarray'):  # sparse matrix
-                        bg_processed = bg_processed.toarray()
-                    bg_numeric = np.asarray(bg_processed, dtype=float)
-                else:
-                    bg_numeric = bg_capped.values.astype(float)
+                    def _predict_preprocessed(values):
+                        return predict_fn(values)
 
-                # Preprocess input data to numeric space for KernelExplainer
-                if preprocessor is not None:
-                    input_processed = preprocessor.transform(input_data)
-                    if hasattr(input_processed, 'toarray'):
-                        input_processed = input_processed.toarray()
-                    input_numeric = np.asarray(input_processed, dtype=float)
-                else:
-                    input_numeric = input_data.values.astype(float)
-
-                # Predict function for preprocessed data
-                if hasattr(final_estimator, 'predict_proba'):
-                    predict_fn = final_estimator.predict_proba
-                else:
-                    predict_fn = final_estimator.predict
-
-                def _predict_preprocessed(values):
-                    return predict_fn(values)
-
-                # Create KernelExplainer
-                np.random.seed(42)
-                explainer = shap.KernelExplainer(_predict_preprocessed, bg_numeric)
-                shap_values = explainer.shap_values(input_numeric)
-                expected_value = explainer.expected_value
+                    np.random.seed(42)
+                    logger.info("[_compute_shap] Using shap.KernelExplainer (this may be slow)")
+                    explainer = shap.KernelExplainer(_predict_preprocessed, bg_numeric)
+                    shap_values = explainer.shap_values(input_numeric)
+                    expected_value = explainer.expected_value
+                    logger.info(f"[_compute_shap] KernelExplainer completed: shap_values type={type(shap_values)}")
 
         else:
-            # For non-pipeline models, try TreeExplainer first for tree-based models
+            # For non-pipeline models, use shap.Explainer for auto-detection
+            logger.info("[_compute_shap] Model is NOT a Pipeline - using model directly")
             try:
-                explainer = shap.TreeExplainer(model_obj)
-                shap_values = explainer.shap_values(input_data)
+                logger.info("[_compute_shap] Attempting shap.Explainer on raw model")
+                explainer = shap.Explainer(model_obj, input_data)
+                shap_values = explainer(input_data)
                 expected_value = explainer.expected_value
-            except Exception:
-                # Fallback to KernelExplainer
-                if background_data is not None and len(background_data) > 0:
-                    bg_raw = background_data if len(background_data) <= MAX_GLOBAL_SHAP_SAMPLES else background_data.iloc[:MAX_GLOBAL_SHAP_SAMPLES]
-                    bg = _prepare_background(bg_raw)
-                else:
-                    # Generate synthetic background if none provided
-                    bg = _prepare_background(input_data)
-
-                predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
-
-                def _predict_with_columns(values):
-                    if isinstance(values, np.ndarray):
-                        df = pd.DataFrame(values, columns=expected_columns)
+                logger.info(f"[_compute_shap] shap.Explainer succeeded: shap_values type={type(shap_values)}")
+                # Convert shap.Explanation to raw array if needed
+                if hasattr(shap_values, 'values'):
+                    shap_values = shap_values.values
+                    logger.debug(f"[_compute_shap] Converted shap.Explanation to values array")
+            except Exception as e:
+                logger.warning(f"[_compute_shap] shap.Explainer failed: {e}, falling back to TreeExplainer")
+                # Auto-detect failed, fallback to manual TreeExplainer
+                try:
+                    logger.info("[_compute_shap] Trying shap.TreeExplainer on raw model")
+                    explainer = shap.TreeExplainer(model_obj, input_data)
+                    shap_values = explainer.shap_values(input_data)
+                    expected_value = explainer.expected_value
+                    logger.info(f"[_compute_shap] TreeExplainer succeeded")
+                except Exception as e2:
+                    logger.warning(f"[_compute_shap] TreeExplainer failed: {e2}, falling back to KernelExplainer")
+                    # TreeExplainer failed, fallback to KernelExplainer (slow)
+                    if background_data is not None and len(background_data) > 0:
+                        bg_raw = background_data if len(background_data) <= MAX_GLOBAL_SHAP_SAMPLES else background_data.iloc[:MAX_GLOBAL_SHAP_SAMPLES]
+                        logger.info(f"[_compute_shap] Using provided background data: shape={bg_raw.shape}")
+                        bg = _prepare_background(bg_raw)
                     else:
-                        df = values[expected_columns] if isinstance(values, pd.DataFrame) else values
-                    return predict_fn(df)
+                        # Generate synthetic background if none provided
+                        logger.info("[_compute_shap] No background data, using input_data as background")
+                        bg = _prepare_background(input_data)
+                    logger.info(f"[_compute_shap] Background prepared: shape={bg.shape}")
 
-                np.random.seed(42)  # Ensure deterministic sampling
-                explainer = shap.KernelExplainer(_predict_with_columns, bg.values)
-                shap_values = explainer.shap_values(input_data.values)
-                expected_value = explainer.expected_value
+                    predict_fn = model_obj.predict_proba if hasattr(model_obj, "predict_proba") else model_obj.predict
+
+                    def _predict_with_columns(values):
+                        if isinstance(values, np.ndarray):
+                            df = pd.DataFrame(values, columns=expected_columns)
+                        else:
+                            df = values[expected_columns] if isinstance(values, pd.DataFrame) else values
+                        return predict_fn(df)
+
+                    np.random.seed(42)  # Ensure deterministic sampling
+                    logger.info("[_compute_shap] Creating KernelExplainer with bg.values")
+                    explainer = shap.KernelExplainer(_predict_with_columns, bg.values)
+                    shap_values = explainer.shap_values(input_data.values)
+                    expected_value = explainer.expected_value
+                    logger.info(f"[_compute_shap] KernelExplainer completed")
 
         # ------------------------------------------------------------
         # AGGREGATION: For pipelines with OneHotEncoder, combine one-hot
@@ -730,6 +835,7 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
         # not hundreds of one-hot encoded columns.
         # ------------------------------------------------------------
         if isinstance(model_obj, Pipeline):
+            logger.debug("[_compute_shap] Checking for aggregation (OneHotEncoder)")
             preprocessor = None
             for step_name, step_obj in model_obj.steps:
                 if hasattr(step_obj, 'transform'):
@@ -744,12 +850,14 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                 original_feature_names_set = set()
 
                 if hasattr(preprocessor, 'transformers_'):
+                    logger.debug(f"[_compute_shap] Preprocessor has transformers_: {len(preprocessor.transformers_)} transformers")
                     for transformer_name, transformer_obj, cols in preprocessor.transformers_:
                         transformer_class = transformer_obj.__class__.__name__
-
+                        logger.debug(f"[_compute_shap] Transformer: name={transformer_name}, class={transformer_class}, cols={cols}")
                         for col in cols:
                             original_feature_names_set.add(col)
                             # Find all encoded columns that belong to this original column
+                            col_str = str(col)  # Convert to string to handle both integer indices and string names
                             for idx, fname in enumerate(final_feature_names):
                                 if isinstance(fname, bytes):
                                     fname = fname.decode('utf-8')
@@ -761,14 +869,22 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                                 else:
                                     norm_name = fname_str
                                 # Match: exact match for numeric, or starts with "col_" for one-hot
-                                if norm_name == col or norm_name.startswith(col + '_'):
-                                    original_to_encoded[col].append(idx)
+                                if norm_name == col_str or norm_name.startswith(col_str + '_'):
+                                    original_to_encoded[col].append(idx)  # Use original col (not col_str) as key
+
+                    logger.info(f"[_compute_shap] Aggregation mapping built: {len(original_to_encoded)} original features mapped")
+                    logger.debug(f"[_compute_shap] original_to_encoded keys (first 5): {list(original_to_encoded.keys())[:5]}")
+                    for k, v in list(original_to_encoded.items())[:5]:
+                        logger.debug(f"[_compute_shap]   {k!r} -> indices {v}")
 
                 # If we found any grouping, aggregate
                 if original_to_encoded:
+                    logger.info(f"[_compute_shap] Starting aggregation: shap_values type={type(shap_values)}")
                     n_samples = shap_values.shape[0] if hasattr(shap_values, 'shape') else len(shap_values)
+                    logger.debug(f"[_compute_shap] n_samples from shap_values: {n_samples}")
                     # Ensure shap_values is 2D
                     if isinstance(shap_values, list):
+                        logger.debug(f"[_compute_shap] shap_values is a list with {len(shap_values)} classes")
                         # For classification, we take the class 1 (positive) for binary, or first class
                         # Convert to 2D array
                         if len(shap_values) > 0:
@@ -779,18 +895,21 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                             else:
                                 class_idx = 0
                             shap_arr = np.asarray(shap_values[class_idx])
+                            logger.debug(f"[_compute_shap] Selected class_idx={class_idx}, shap_arr shape={shap_arr.shape}, ndim={shap_arr.ndim}")
                             if shap_arr.ndim == 1:
                                 shap_arr = shap_arr.reshape(1, -1)
                         else:
                             shap_arr = np.array([])
                     else:
                         shap_arr = np.asarray(shap_values)
+                        logger.debug(f"[_compute_shap] shap_values is array: shape={shap_arr.shape}, ndim={shap_arr.ndim}")
                         if shap_arr.ndim == 1:
                             shap_arr = shap_arr.reshape(1, -1)
 
                     if shap_arr.ndim == 2 and shap_arr.shape[0] > 0:
                         # Create aggregated array
                         orig_features_list = sorted(original_feature_names_set)
+                        logger.info(f"[_compute_shap] Aggregating: orig_features_list length={len(orig_features_list)}")
                         aggregated_shap = np.zeros((shap_arr.shape[0], len(orig_features_list)), dtype=float)
 
                         for agg_idx, orig_feat in enumerate(orig_features_list):
@@ -804,9 +923,18 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
 
                         shap_values = aggregated_shap
                         final_feature_names = orig_features_list
+                        logger.info(f"[_compute_shap] Aggregation complete: final shap_values shape={shap_values.shape}, final_feature_names count={len(final_feature_names)}")
+                    else:
+                        logger.warning(f"[_compute_shap] shap_arr is not 2D or has 0 samples, skipping aggregation")
                     # else: shap_values is empty or malformed, leave as-is
 
+        logger.info(f"[_compute_shap] RETURN: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}, final_feature_names count={len(final_feature_names)}")
         return shap_values, expected_value, final_feature_names
+
+    except Exception as e:
+        logger.error(f"[_compute_shap] FAILED with exception: {type(e).__name__}: {e}")
+        logger.error(f"[_compute_shap] Full traceback:\n{traceback.format_exc()}")
+        raise ValueError(f"SHAP computation failed: {str(e)}")
 
     except Exception as e:
         raise ValueError(f"SHAP computation failed: {str(e)}")

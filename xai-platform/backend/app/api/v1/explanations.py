@@ -217,6 +217,9 @@ async def request_global_explanation(
         }
 
     except Exception as e:
+        import traceback
+        error_detail = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+        print(f"[ERROR] request_global_explanation failed: {error_detail}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/global/{model_id}/latest")
@@ -246,6 +249,9 @@ async def get_global_explanation(
             raise HTTPException(status_code=404, detail="No global explanation found. Please request one first.")
 
     except Exception as e:
+        import traceback
+        error_detail = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+        print(f"[ERROR] get_global_explanation failed: {error_detail}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # LIME Endpoints

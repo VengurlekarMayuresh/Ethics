@@ -371,22 +371,54 @@ class ModelLoaderService:
 
             # Check if model is a Pipeline
             if isinstance(model_obj, Pipeline):
-                # For pipelines, get feature names from the preprocessing step
-                preprocessing_step = None
+                # For pipelines, we want the RAW input features (what users will provide).
+                # There are two cases:
+                # 1. Pipeline starts with a custom transformer (like FeatureEngineer) that
+                #    stores raw_feature_names or has feature_names_in_ set to raw inputs.
+                # 2. Pipeline starts directly with a preprocessor (ColumnTransformer).
+                # We need to find the first step that knows about raw inputs.
+
+                raw_feature_step = None
                 for step_name, step in model_obj.steps:
-                    if hasattr(step, 'transformers_') or hasattr(step, 'feature_names_in_'):
-                        preprocessing_step = step
+                    # Check if this step has raw_feature_names (custom attribute from FeatureEngineer)
+                    if hasattr(step, 'raw_feature_names'):
+                        raw_feature_step = step
+                        break
+                    # Check if this step has feature_names_in_ (sklearn automatically sets this
+                    # when fit is called with a DataFrame). The first step with this is likely
+                    # the raw input step.
+                    if hasattr(step, 'feature_names_in_'):
+                        raw_feature_step = step
+                        break
+                    # If we encounter a step with transformers_ (ColumnTransformer), it's a
+                    # preprocessor that receives already-transformed data, so we stop searching.
+                    if hasattr(step, 'transformers_'):
                         break
 
-                if preprocessing_step and hasattr(preprocessing_step, 'feature_names_in_'):
-                    # ColumnTransformer or similar: get the original feature names
-                    feature_names = preprocessing_step.feature_names_in_.tolist()
+                if raw_feature_step:
+                    # Found a step with raw feature names
+                    if hasattr(raw_feature_step, 'raw_feature_names'):
+                        feature_names = raw_feature_step.raw_feature_names
+                    else:
+                        feature_names = raw_feature_step.feature_names_in_.tolist()
 
-                    # Infer feature types by examining the ColumnTransformer's transformers
-                    # Categorical features are those handled by OneHotEncoder or similar
-                    if hasattr(preprocessing_step, 'transformers_'):
-                        for transformer_name, transformer_obj, cols in preprocessing_step.transformers_:
-                            # Check the transformer's class to determine feature type
+                    # Now infer feature types from the raw feature names and possibly from
+                    # the subsequent preprocessing step if we can find it.
+                    # Look for the ColumnTransformer or preprocessor to determine which raw features
+                    # are categorical vs numeric.
+                    preprocessor = None
+                    found_raw_step = False
+                    for step_name, step in model_obj.steps:
+                        if step is raw_feature_step:
+                            found_raw_step = True
+                            continue
+                        if found_raw_step and (hasattr(step, 'transformers_') or hasattr(step, 'feature_names_in_')):
+                            preprocessor = step
+                            break
+
+                    if preprocessor and hasattr(preprocessor, 'transformers_'):
+                        # Map raw features to their types based on which transformer handles them
+                        for transformer_name, transformer_obj, cols in preprocessor.transformers_:
                             transformer_class = transformer_obj.__class__.__name__
                             if 'OneHotEncoder' in transformer_class:
                                 for col in cols:
@@ -395,18 +427,13 @@ class ModelLoaderService:
                                 for col in cols:
                                     feature_types[col] = "numeric"
                             else:
-                                # Unknown transformer, mark as numeric by default
                                 for col in cols:
                                     feature_types[col] = "numeric"
-                    else:
-                        # Can't determine from transformers, use dataset analysis or defaults
-                        pass
-
                 elif hasattr(model_obj, 'feature_names_in_'):
-                    # Pipeline itself might have feature names
+                    # Pipeline itself might have feature names (no steps with feature_names_in_)
                     feature_names = model_obj.feature_names_in_.tolist()
                 else:
-                    # Fallback
+                    # Fallback: try to get from dataset_analysis or infer from final model
                     if dataset_analysis:
                         feature_names = list(dataset_analysis.keys())
                     else:

@@ -65,7 +65,7 @@ export default function GlobalExplanationPage() {
     enabled: !!modelId,
   });
 
-  // Fetch latest global explanation
+  // Fetch latest global explanation with polling
   const {
     data: explanation,
     isLoading: explanationLoading,
@@ -82,6 +82,18 @@ export default function GlobalExplanationPage() {
     },
     enabled: !!modelId && !!requestMethod,
     retry: false,
+    // Poll every 3 seconds while there's no explanation data (task pending)
+    refetchInterval: (query) => {
+      // Keep polling if:
+      // 1. No data yet (task is computing)
+      // 2. And not in a loading state (to avoid overlapping)
+      // 3. And no error (except 404 which means not ready yet)
+      if (!query.data && !query.isLoading) {
+        const is404 = query.error?.response?.status === 404;
+        return is404 ? 3000 : false;
+      }
+      return false; // Stop polling once we have data or error other than 404
+    },
   });
 
   // Request global explanation mutation
