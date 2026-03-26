@@ -17,7 +17,7 @@ import {
 import Link from 'next/link';
 import FeatureImportanceBar from '@/components/charts/FeatureImportanceBar';
 import SHAPBeeswarm from '@/components/charts/SHAPBeeswarm';
-import SHAPWaterfall from '@/components/charts/SHAPWaterfall';
+import SHAPForcePlot from '@/components/charts/SHAPForcePlot';
 import LIMEPlot from '@/components/charts/LIMEPlot';
 import { format } from 'date-fns';
 
@@ -631,12 +631,11 @@ export default function UnifiedExplanationPage() {
                     <p><b>expected_value:</b> {String(localShap.expected_value)}</p>
                     <p><b>shapValuesFormatted count:</b> {shapValuesFormatted.length}</p>
                   </div>
-                  <SHAPWaterfall
+                  <SHAPForcePlot
                     shapValues={shapValuesFormatted}
                     baseValue={baseValue}
                     prediction={predValue}
                     title="SHAP Force Plot (Local Explanation)"
-                    height={500}
                   />
                 </div>
               );
