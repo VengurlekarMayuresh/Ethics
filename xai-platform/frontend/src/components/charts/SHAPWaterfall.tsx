@@ -24,7 +24,7 @@ interface SHAPWaterfallProps {
   baseValue: number;
   prediction: number;
   title?: string;
-  height?: number | string;
+  height?: number;
 }
 
 const SHAPWaterfall: React.FC<SHAPWaterfallProps> = ({

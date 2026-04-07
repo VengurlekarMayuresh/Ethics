@@ -1,0 +1,30 @@
+# requirements-xai-frameworks.txt
+# This file tracks known dependencies and conflicts for the newer XAI frameworks.
+
+# ==========================================
+# InterpretML
+# ==========================================
+# InterpretML is generally stable with modern scikit-learn, but we lock to tested versions
+interpret>=0.6.0
+pandas>=1.5.0
+
+# ==========================================
+# Alibi Explain
+# ==========================================
+# Alibi requires tensorflow for many of its explainers (like CEM) 
+# and often has strict dependencies.
+alibi[all]>=0.9.0
+tensorflow>=2.10.0,<2.16.0
+
+# ==========================================
+# AIX360 (AI Explainability 360)
+# ==========================================
+# AIX360 is known to have conflicts with newer scikit-learn (>=1.4.0) and numpy (>=2.0)
+# Below pins resolve Common installation failures:
+aix360==0.3.0
+scikit-learn==1.3.2  # AIX360 relies on older scikit-learn internal attributes
+numpy<2.0            # AIX360 has compatibility issues with numpy 2.0+
+
+# Standard data science libraries for demonstrations
+matplotlib>=3.5.0
+joblib>=1.1.0

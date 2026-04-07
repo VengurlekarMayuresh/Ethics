@@ -19,7 +19,7 @@ interface FeatureImportance {
 interface FeatureImportanceBarProps {
   data: FeatureImportance[];
   title?: string;
-  height?: number | string;
+  height?: number;
   color?: string;
 }
 

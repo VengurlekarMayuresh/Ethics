@@ -18,7 +18,7 @@ interface SHAPBeeswarmProps {
   featureNames: string[];
   sampleValues?: number[][]; // Optional: feature values for coloring
   title?: string;
-  height?: number | string;
+  height?: number;
   maxPointsPerFeature?: number; // Limit for performance
 }
 

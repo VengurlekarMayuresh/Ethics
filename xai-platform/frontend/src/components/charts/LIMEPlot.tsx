@@ -24,7 +24,7 @@ interface LIMEPlotProps {
   intercept?: number;
   localPred?: number;
   title?: string;
-  height?: number | string;
+  height?: number;
 }
 
 const LIMEPlot: React.FC<LIMEPlotProps> = ({

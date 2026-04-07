@@ -31,6 +31,7 @@ COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
 COPY --from=builder --chown=nextjs:nodejs /app/next.config.ts ./
 COPY --from=builder --chown=nextjs:nodejs /app/next-env.d.ts ./
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 
 # Switch to non-root user
 USER nextjs

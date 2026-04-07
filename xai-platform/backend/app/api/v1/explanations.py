@@ -517,8 +517,11 @@ async def get_explanation_by_prediction(
             prediction_id_filters.append({"prediction_id": ObjectId(prediction_id)})
 
         filter_query = {"$or": prediction_id_filters, "explanation_type": "local"}
-        if method in ('shap', 'lime'):
-            filter_query["method"] = method
+        
+        # Updated to support new methods (case-insensitive check)
+        target_methods = ('shap', 'lime', 'interpretml', 'alibi', 'aix360')
+        if method and method.lower() in target_methods:
+            filter_query["method"] = method.lower()
 
         explanation = await db.explanations.find_one(
             filter_query,
@@ -533,12 +536,27 @@ async def get_explanation_by_prediction(
         else:
             # If explanation not found, check if a task is pending for the requested method
             task_id = None
-            if method == 'shap':
+            m_lower = method.lower() if method else None
+            
+            if m_lower == 'shap':
                 task_id = prediction.get("explanation_task_id")
-            elif method == 'lime':
+            elif m_lower == 'lime':
                 task_id = prediction.get("lime_task_id")
+            elif m_lower == 'interpretml':
+                task_id = prediction.get("interpretml_task_id")
+            elif m_lower == 'alibi':
+                task_id = prediction.get("alibi_task_id")
+            elif m_lower == 'aix360':
+                task_id = prediction.get("aix360_task_id")
             else:
-                task_id = prediction.get("explanation_task_id") or prediction.get("lime_task_id")
+                # If no method specified, check any available local explanation task ID
+                task_id = (
+                    prediction.get("explanation_task_id") or 
+                    prediction.get("lime_task_id") or
+                    prediction.get("interpretml_task_id") or
+                    prediction.get("alibi_task_id") or
+                    prediction.get("aix360_task_id")
+                )
 
             if task_id:
                 task = celery_app.AsyncResult(task_id)
@@ -1017,3 +1035,353 @@ Use plain English. Do not use jargon like "SHAP values" in the final summary —
     )
     return {"explanation": template, "source": "template"}
 
+
+
+# ==========================================
+# InterpretML Endpoints
+# ==========================================
+@router.post("/interpretml/{model_id}")
+async def request_interpretml_explanation(
+    request: Request,
+    model_id: str,
+    prediction_id: str = None,
+    num_features: int = 10,
+    file: UploadFile = File(None),
+    input_data: str = Form(None),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        db = await get_db()
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        target_prediction_id = None
+        if prediction_id:
+            pred = await db.predictions.find_one({"_id": ObjectId(prediction_id), "model_id": model_id, "user_id": current_user["_id"]})
+            if not pred:
+                raise HTTPException(status_code=400, detail="Prediction not found")
+            target_prediction_id = prediction_id
+        elif input_data:
+            input_dict = json.loads(input_data)
+            prediction_doc = {
+                "model_id": model_id, "user_id": current_user["_id"], "input_data": input_dict,
+                "prediction": None, "probability": None, "latency_ms": None, "created_at": datetime.utcnow()
+            }
+            result = await db.predictions.insert_one(prediction_doc)
+            target_prediction_id = str(result.inserted_id)
+        else:
+            last_pred = await db.predictions.find_one({"model_id": model_id, "user_id": current_user["_id"]}, sort=[("created_at", -1)])
+            if last_pred:
+                target_prediction_id = str(last_pred["_id"])
+
+        if not target_prediction_id:
+            raise HTTPException(status_code=400, detail="No prediction found.")
+
+        task = celery_app.send_task("compute_interpretml_values", args=[target_prediction_id, model_id, num_features])
+        celery_task_id = task.id
+
+        await db.predictions.update_one({"_id": ObjectId(target_prediction_id)}, {"$set": {"interpretml_task_id": celery_task_id}})
+        await log_action(user_id=current_user["_id"], action=AuditActions.EXPLANATION_CREATE, resource_type="explanation", details={"task_id": celery_task_id, "prediction_id": target_prediction_id, "model_id": model_id, "method": "interpretml"}, request=request)
+        return {"message": "InterpretML computation started", "task_id": celery_task_id, "prediction_id": target_prediction_id, "model_id": model_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/interpretml/{task_id}")
+async def get_interpretml_result(task_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        db = await get_db()
+        task = celery_app.AsyncResult(task_id)
+        if task.ready():
+            result = task.get()
+            explanation_data = None
+            if isinstance(result, dict) and result.get("explanation_id"):
+                explanation = await db.explanations.find_one({"_id": ObjectId(result["explanation_id"])})
+                if explanation:
+                    explanation["_id"] = str(explanation["_id"])
+                    explanation["prediction_id"] = str(explanation["prediction_id"])
+                    explanation["model_id"] = str(explanation["model_id"])
+                    explanation_data = explanation
+            return {"status": "complete", "explanation": explanation_data if explanation_data else result}
+        else:
+            return {"status": "pending", "task_state": task.state, "info": task.info if task.info else None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/interpretml/global/{model_id}")
+async def request_global_interpretml(
+    request: Request,
+    model_id: str,
+    background_data: UploadFile = File(...),
+    num_features: int = Form(10),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        db = await get_db()
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        contents = await background_data.read()
+        bg_object_name = f"{current_user['_id']}/interpretml_bg_{int(datetime.utcnow().timestamp())}_{background_data.filename}"
+        await storage.upload_file(contents, bg_object_name)
+
+        task = celery_app.send_task("compute_global_interpretml", args=[model_id, bg_object_name, num_features])
+        return {"message": "Global InterpretML computation started", "task_id": task.id, "model_id": model_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/interpretml/global/{model_id}/latest")
+async def get_global_interpretml(model_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        db = await get_db()
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        query = {"method": "interpretml", "explanation_type": "global"}
+        if ObjectId.is_valid(model_id):
+            query["model_id"] = {"$in": [model_id, ObjectId(model_id)]}
+        else:
+            query["model_id"] = model_id
+
+        explanation = await db.explanations.find_one(query, sort=[("created_at", -1)])
+        if explanation:
+            explanation["_id"] = str(explanation["_id"])
+            return explanation
+        else:
+            raise HTTPException(status_code=404, detail="No global InterpretML explanation found.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# Alibi Endpoints
+# ==========================================
+@router.post("/alibi/{model_id}")
+async def request_alibi_explanation(
+    request: Request,
+    model_id: str,
+    prediction_id: str = None,
+    num_features: int = 10,
+    file: UploadFile = File(None),
+    input_data: str = Form(None),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        db = await get_db()
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        target_prediction_id = None
+        if prediction_id:
+            pred = await db.predictions.find_one({"_id": ObjectId(prediction_id), "model_id": model_id, "user_id": current_user["_id"]})
+            if not pred:
+                raise HTTPException(status_code=400, detail="Prediction not found")
+            target_prediction_id = prediction_id
+        elif input_data:
+            input_dict = json.loads(input_data)
+            prediction_doc = {
+                "model_id": model_id, "user_id": current_user["_id"], "input_data": input_dict,
+                "prediction": None, "probability": None, "latency_ms": None, "created_at": datetime.utcnow()
+            }
+            result = await db.predictions.insert_one(prediction_doc)
+            target_prediction_id = str(result.inserted_id)
+        else:
+            last_pred = await db.predictions.find_one({"model_id": model_id, "user_id": current_user["_id"]}, sort=[("created_at", -1)])
+            if last_pred:
+                target_prediction_id = str(last_pred["_id"])
+
+        if not target_prediction_id:
+            raise HTTPException(status_code=400, detail="No prediction found.")
+
+        task = celery_app.send_task("compute_alibi_values", args=[target_prediction_id, model_id, num_features])
+        celery_task_id = task.id
+
+        await db.predictions.update_one({"_id": ObjectId(target_prediction_id)}, {"$set": {"alibi_task_id": celery_task_id}})
+        return {"message": "Alibi computation started", "task_id": celery_task_id, "prediction_id": target_prediction_id, "model_id": model_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/alibi/{task_id}")
+async def get_alibi_result(task_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        db = await get_db()
+        task = celery_app.AsyncResult(task_id)
+        if task.ready():
+            result = task.get()
+            explanation_data = None
+            if isinstance(result, dict) and result.get("explanation_id"):
+                explanation = await db.explanations.find_one({"_id": ObjectId(result["explanation_id"])})
+                if explanation:
+                    explanation["_id"] = str(explanation["_id"])
+                    explanation["prediction_id"] = str(explanation["prediction_id"])
+                    explanation["model_id"] = str(explanation["model_id"])
+                    explanation_data = explanation
+            return {"status": "complete", "explanation": explanation_data if explanation_data else result}
+        else:
+            return {"status": "pending", "task_state": task.state, "info": task.info if task.info else None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/alibi/global/{model_id}")
+async def request_global_alibi(
+    request: Request,
+    model_id: str,
+    background_data: UploadFile = File(...),
+    num_features: int = Form(10),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        db = await get_db()
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        contents = await background_data.read()
+        bg_object_name = f"{current_user['_id']}/alibi_bg_{int(datetime.utcnow().timestamp())}_{background_data.filename}"
+        await storage.upload_file(contents, bg_object_name)
+
+        task = celery_app.send_task("compute_global_alibi", args=[model_id, bg_object_name, num_features])
+        return {"message": "Global Alibi computation started", "task_id": task.id, "model_id": model_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/alibi/global/{model_id}/latest")
+async def get_global_alibi(model_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        db = await get_db()
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        query = {"method": "alibi", "explanation_type": "global"}
+        if ObjectId.is_valid(model_id):
+            query["model_id"] = {"$in": [model_id, ObjectId(model_id)]}
+        else:
+            query["model_id"] = model_id
+
+        explanation = await db.explanations.find_one(query, sort=[("created_at", -1)])
+        if explanation:
+            explanation["_id"] = str(explanation["_id"])
+            return explanation
+        else:
+            raise HTTPException(status_code=404, detail="No global Alibi explanation found.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# AIX360 Endpoints
+# ==========================================
+@router.post("/aix360/{model_id}")
+async def request_aix360_explanation(
+    request: Request,
+    model_id: str,
+    prediction_id: str = None,
+    num_features: int = 10,
+    file: UploadFile = File(None),
+    input_data: str = Form(None),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        db = await get_db()
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        target_prediction_id = None
+        if prediction_id:
+            pred = await db.predictions.find_one({"_id": ObjectId(prediction_id), "model_id": model_id, "user_id": current_user["_id"]})
+            if not pred:
+                raise HTTPException(status_code=400, detail="Prediction not found")
+            target_prediction_id = prediction_id
+        elif input_data:
+            input_dict = json.loads(input_data)
+            prediction_doc = {
+                "model_id": model_id, "user_id": current_user["_id"], "input_data": input_dict,
+                "prediction": None, "probability": None, "latency_ms": None, "created_at": datetime.utcnow()
+            }
+            result = await db.predictions.insert_one(prediction_doc)
+            target_prediction_id = str(result.inserted_id)
+        else:
+            last_pred = await db.predictions.find_one({"model_id": model_id, "user_id": current_user["_id"]}, sort=[("created_at", -1)])
+            if last_pred:
+                target_prediction_id = str(last_pred["_id"])
+
+        if not target_prediction_id:
+            raise HTTPException(status_code=400, detail="No prediction found.")
+
+        task = celery_app.send_task("compute_aix360_values", args=[target_prediction_id, model_id, num_features])
+        celery_task_id = task.id
+
+        await db.predictions.update_one({"_id": ObjectId(target_prediction_id)}, {"$set": {"aix360_task_id": celery_task_id}})
+        return {"message": "AIX360 computation started", "task_id": celery_task_id, "prediction_id": target_prediction_id, "model_id": model_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/aix360/{task_id}")
+async def get_aix360_result(task_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        db = await get_db()
+        task = celery_app.AsyncResult(task_id)
+        if task.ready():
+            result = task.get()
+            explanation_data = None
+            if isinstance(result, dict) and result.get("explanation_id"):
+                explanation = await db.explanations.find_one({"_id": ObjectId(result["explanation_id"])})
+                if explanation:
+                    explanation["_id"] = str(explanation["_id"])
+                    explanation["prediction_id"] = str(explanation["prediction_id"])
+                    explanation["model_id"] = str(explanation["model_id"])
+                    explanation_data = explanation
+            return {"status": "complete", "explanation": explanation_data if explanation_data else result}
+        else:
+            return {"status": "pending", "task_state": task.state, "info": task.info if task.info else None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/aix360/global/{model_id}")
+async def request_global_aix360(
+    request: Request,
+    model_id: str,
+    background_data: UploadFile = File(...),
+    num_features: int = Form(10),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        db = await get_db()
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        contents = await background_data.read()
+        bg_object_name = f"{current_user['_id']}/aix360_bg_{int(datetime.utcnow().timestamp())}_{background_data.filename}"
+        await storage.upload_file(contents, bg_object_name)
+
+        task = celery_app.send_task("compute_global_aix360", args=[model_id, bg_object_name, num_features])
+        return {"message": "Global AIX360 computation started", "task_id": task.id, "model_id": model_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/aix360/global/{model_id}/latest")
+async def get_global_aix360(model_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        db = await get_db()
+        model_doc = await db.models.find_one({"_id": ObjectId(model_id), "user_id": current_user["_id"]})
+        if not model_doc:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        query = {"method": "aix360", "explanation_type": "global"}
+        if ObjectId.is_valid(model_id):
+            query["model_id"] = {"$in": [model_id, ObjectId(model_id)]}
+        else:
+            query["model_id"] = model_id
+
+        explanation = await db.explanations.find_one(query, sort=[("created_at", -1)])
+        if explanation:
+            explanation["_id"] = str(explanation["_id"])
+            return explanation
+        else:
+            raise HTTPException(status_code=404, detail="No global AIX360 explanation found.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

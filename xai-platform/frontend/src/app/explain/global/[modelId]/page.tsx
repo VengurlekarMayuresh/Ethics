@@ -2,7 +2,7 @@
 
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { api } from '@/lib/api';
-import { useParams, useRouter } from 'next/navigation';
+import { useParams } from 'next/navigation';
 import { useState } from 'react';
 import {
   ArrowLeft,
@@ -14,22 +14,39 @@ import {
   FileText,
   ChevronDown,
   ScatterChart,
+  Cpu,
+  Anchor,
+  BookOpen,
 } from 'lucide-react';
 import Link from 'next/link';
 import FeatureImportanceBar from '@/components/charts/FeatureImportanceBar';
 import SHAPBeeswarm from '@/components/charts/SHAPBeeswarm';
 import SHAPDependence from '@/components/charts/SHAPDependence';
+import AlibiRuleDisplay from '@/components/charts/AlibiRuleDisplay';
+import AIX360RuleDisplay from '@/components/charts/AIX360RuleDisplay';
 import { format } from 'date-fns';
+
+type FrameworkMethod = 'shap' | 'lime' | 'interpretml' | 'alibi' | 'aix360';
 
 interface GlobalExplanation {
   _id: string;
-  method: 'shap' | 'lime';
+  method: FrameworkMethod;
   explanation_type: 'global';
+  // SHAP fields
   shap_values?: number[][];
   expected_value?: number | number[];
+  // Shared
   feature_names: string[];
   global_importance?: Array<{ feature: string; importance: number }>;
   lime_global_importance?: Array<{ feature: string; importance: number }>;
+  // New frameworks
+  explanation_data?: {
+    feature_importance?: Array<{ feature: string; importance: number }>;
+    rules?: Array<{ rule: string; prediction?: string; confidence?: number; support?: number }>;
+    anchor?: { rule?: string; conditions?: string[]; precision?: number; coverage?: number; prediction?: string };
+    status?: string;
+    error?: string;
+  };
   created_at: string;
 }
 
@@ -42,20 +59,82 @@ interface Model {
   feature_schema: Array<{ name: string; type: string; options?: string[] }>;
 }
 
+// ── Per-framework config ────────────────────────────────────────────────────
+const FRAMEWORK_CONFIG: Record<
+  FrameworkMethod,
+  { label: string; color: string; activeClass: string; inactiveClass: string; icon: React.ElementType; postEndpoint: (id: string) => string; getEndpoint: (id: string) => string }
+> = {
+  shap: {
+    label: 'SHAP',
+    color: '#3b82f6',
+    activeClass: 'bg-indigo-600 text-white',
+    inactiveClass: 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50',
+    icon: BarChart3,
+    postEndpoint: (id) => `/explain/global/${id}`,
+    getEndpoint: (id) => `/explain/global/${id}/latest`,
+  },
+  lime: {
+    label: 'LIME',
+    color: '#8b5cf6',
+    activeClass: 'bg-purple-600 text-white',
+    inactiveClass: 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50',
+    icon: FileText,
+    postEndpoint: (id) => `/explain/lime/global/${id}`,
+    getEndpoint: (id) => `/explain/lime/global/${id}/latest`,
+  },
+  interpretml: {
+    label: 'InterpretML',
+    color: '#0d9488',
+    activeClass: 'bg-teal-600 text-white',
+    inactiveClass: 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50',
+    icon: Cpu,
+    postEndpoint: (id) => `/explain/interpretml/global/${id}`,
+    getEndpoint: (id) => `/explain/interpretml/global/${id}/latest`,
+  },
+  alibi: {
+    label: 'Alibi',
+    color: '#0ea5e9',
+    activeClass: 'bg-sky-600 text-white',
+    inactiveClass: 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50',
+    icon: Anchor,
+    postEndpoint: (id) => `/explain/alibi/global/${id}`,
+    getEndpoint: (id) => `/explain/alibi/global/${id}/latest`,
+  },
+  aix360: {
+    label: 'AIX360',
+    color: '#d97706',
+    activeClass: 'bg-amber-600 text-white',
+    inactiveClass: 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50',
+    icon: BookOpen,
+    postEndpoint: (id) => `/explain/aix360/global/${id}`,
+    getEndpoint: (id) => `/explain/aix360/global/${id}/latest`,
+  },
+};
+
 export default function GlobalExplanationPage() {
   const params = useParams();
-  const router = useRouter();
   const modelId = params.modelId as string;
 
   const [backgroundFile, setBackgroundFile] = useState<File | null>(null);
-  const [requestMethod, setRequestMethod] = useState<'shap' | 'lime'>('shap');
+  const [requestMethod, setRequestMethod] = useState<FrameworkMethod>('shap');
   const [selectedFeature, setSelectedFeature] = useState<string>('');
   const [dependenceData, setDependenceData] = useState<{ x_values: number[]; shap_values: number[] } | null>(null);
   const [dependenceFeatureFile, setDependenceFeatureFile] = useState<File | null>(null);
   const [isLoadingDependence, setIsLoadingDependence] = useState(false);
-  const [autoTriggeredGlobal, setAutoTriggeredGlobal] = useState(false);
 
-  // Fetch model
+  const cfg = FRAMEWORK_CONFIG[requestMethod];
+
+  // ── Switch framework — clear stale result immediately ────────────────────
+  const handleSwitchMethod = (method: FrameworkMethod) => {
+    if (method === requestMethod) return;
+    setRequestMethod(method);
+    // Clear uploaded file so the upload UI reappears for the new framework
+    setBackgroundFile(null);
+    setDependenceData(null);
+    setSelectedFeature('');
+  };
+
+  // ── Fetch model ──────────────────────────────────────────────────────────
   const { data: model, isLoading: modelLoading } = useQuery<Model>({
     queryKey: ['model', modelId],
     queryFn: async () => {
@@ -65,101 +144,81 @@ export default function GlobalExplanationPage() {
     enabled: !!modelId,
   });
 
-  // Fetch latest global explanation with polling
+  // ── Fetch latest global explanation (per-framework key clears stale data)
   const {
     data: explanation,
     isLoading: explanationLoading,
     error: explanationError,
     refetch: refetchExplanation,
   } = useQuery<GlobalExplanation>({
+    // Key includes requestMethod — switching method gives a fresh cache entry
     queryKey: ['globalExplanation', modelId, requestMethod],
     queryFn: async () => {
-      const endpoint = requestMethod === 'shap'
-        ? `/explain/global/${modelId}/latest`
-        : `/explain/lime/global/${modelId}/latest`;
-      const { data } = await api.get(endpoint);
+      const { data } = await api.get(cfg.getEndpoint(modelId));
       return data;
     },
-    enabled: !!modelId && !!requestMethod,
+    enabled: !!modelId,
     retry: false,
-    // Poll every 3 seconds while there's no explanation data (task pending)
     refetchInterval: (query) => {
-      // Keep polling if:
-      // 1. No data yet (task is computing)
-      // 2. And not in a loading state (to avoid overlapping)
-      // 3. And no error (except 404 which means not ready yet)
-      if (!query.data && !query.isLoading) {
-        const is404 = query.error?.response?.status === 404;
+      if (!query.state.data && query.state.fetchStatus !== 'fetching') {
+        const error = query.state.error as any;
+        const is404 = error?.response?.status === 404;
         return is404 ? 3000 : false;
       }
-      return false; // Stop polling once we have data or error other than 404
+      return false;
     },
   });
 
-  // Request global explanation mutation
+  // ── Request global explanation mutation ─────────────────────────────────
   const requestGlobal = useMutation({
     mutationFn: async () => {
-      if (!backgroundFile) {
-        throw new Error('Background data file is required for global explanation');
-      }
+      if (!backgroundFile) throw new Error('Background data file is required');
       const formData = new FormData();
       formData.append('background_data', backgroundFile);
-      if (requestMethod === 'lime') {
-        // LIME also uses background data? According to backend, it uses same parameter name
-        formData.append('num_features', '10');
-      }
-      const endpoint = requestMethod === 'shap'
-        ? `/explain/global/${modelId}`
-        : `/explain/lime/global/${modelId}`;
-      const { data } = await api.post(endpoint, formData);
+      if (requestMethod === 'lime') formData.append('num_features', '10');
+      const { data } = await api.post(cfg.postEndpoint(modelId), formData);
       return data;
     },
     onSuccess: () => {
-      // Refetch after a delay
-      setTimeout(() => {
-        refetchExplanation();
-      }, 3000);
+      setTimeout(() => refetchExplanation(), 3000);
     },
   });
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setBackgroundFile(e.target.files[0]);
-    }
-  };
-
-  const handleRequest = () => {
-    requestGlobal.mutate();
+    if (e.target.files?.[0]) setBackgroundFile(e.target.files[0]);
   };
 
   const handleFeatureFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setDependenceFeatureFile(e.target.files[0]);
-    }
+    if (e.target.files?.[0]) setDependenceFeatureFile(e.target.files[0]);
   };
 
   const loadDependencePlot = async () => {
     if (!selectedFeature || !dependenceFeatureFile) return;
-
     setIsLoadingDependence(true);
     try {
       const formData = new FormData();
       formData.append('background_data', dependenceFeatureFile);
-
-      const { data } = await api.post(`/explain/dependence/${modelId}?feature=${encodeURIComponent(selectedFeature)}`, formData);
-      setDependenceData({
-        x_values: data.x_values,
-        shap_values: data.shap_values,
-      });
+      const { data } = await api.post(
+        `/explain/dependence/${modelId}?feature=${encodeURIComponent(selectedFeature)}`,
+        formData,
+      );
+      setDependenceData({ x_values: data.x_values, shap_values: data.shap_values });
     } catch (error: any) {
-      console.error('Failed to fetch dependence data:', error);
       alert('Failed to load dependence plot: ' + (error.response?.data?.detail || error.message));
     } finally {
       setIsLoadingDependence(false);
     }
   };
 
-  const isLoading = modelLoading || explanationLoading || requestGlobal.isPending;
+  // ── Derive display data ──────────────────────────────────────────────────
+  const featureImportanceData = (() => {
+    if (!explanation) return null;
+    if (explanation.global_importance?.length) return explanation.global_importance;
+    if (explanation.lime_global_importance?.length) return explanation.lime_global_importance;
+    if (explanation.explanation_data?.feature_importance?.length)
+      return explanation.explanation_data.feature_importance;
+    return null;
+  })();
 
   if (modelLoading) {
     return (
@@ -174,10 +233,8 @@ export default function GlobalExplanationPage() {
       <div className="rounded-lg border border-red-200 bg-red-50 p-8 text-center">
         <AlertCircle className="mx-auto h-12 w-12 text-red-400" />
         <h2 className="mt-4 text-lg font-semibold text-red-900">Model not found</h2>
-        <p className="mt-2 text-red-700">The model you're looking for doesn't exist.</p>
         <Link href="/models" className="mt-4 inline-flex items-center text-red-600 hover:text-red-800">
-          <ArrowLeft className="mr-2 h-4 w-4" />
-          Back to models
+          <ArrowLeft className="mr-2 h-4 w-4" /> Back to models
         </Link>
       </div>
     );
@@ -186,7 +243,7 @@ export default function GlobalExplanationPage() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-4">
         <div className="flex items-center gap-4">
           <Link
             href={`/models/${modelId}`}
@@ -196,50 +253,41 @@ export default function GlobalExplanationPage() {
           </Link>
           <div>
             <h1 className="text-2xl font-bold text-gray-900">Global Explanation</h1>
-            <p className="mt-1 text-sm text-gray-500">
-              Model: {model.name}
-            </p>
+            <p className="mt-1 text-sm text-gray-500">Model: {model.name}</p>
           </div>
         </div>
 
-        {/* Method selector */}
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setRequestMethod('shap')}
-            className={`inline-flex items-center rounded-lg px-4 py-2 text-sm font-medium transition ${
-              requestMethod === 'shap'
-                ? 'bg-indigo-600 text-white'
-                : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'
-            }`}
-          >
-            <BarChart3 className="mr-2 h-4 w-4" />
-            SHAP
-          </button>
-          <button
-            onClick={() => setRequestMethod('lime')}
-            className={`inline-flex items-center rounded-lg px-4 py-2 text-sm font-medium transition ${
-              requestMethod === 'lime'
-                ? 'bg-purple-600 text-white'
-                : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'
-            }`}
-          >
-            <FileText className="mr-2 h-4 w-4" />
-            LIME
-          </button>
+        {/* Framework selector — single-select, 5 options */}
+        <div className="flex flex-wrap items-center gap-2">
+          {(Object.entries(FRAMEWORK_CONFIG) as [FrameworkMethod, typeof cfg][]).map(([method, c]) => {
+            const Icon = c.icon;
+            const isActive = requestMethod === method;
+            return (
+              <button
+                key={method}
+                onClick={() => handleSwitchMethod(method)}
+                className={`inline-flex items-center rounded-lg px-3 py-2 text-sm font-medium transition ${
+                  isActive ? c.activeClass : c.inactiveClass
+                }`}
+              >
+                <Icon className="mr-1.5 h-4 w-4" />
+                {c.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
-      {/* Upload section if no explanation */}
+      {/* Upload section — shown when no explanation exists for this framework */}
       {!explanation && (
         <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-8">
           <div className="text-center">
             <Upload className="mx-auto h-12 w-12 text-gray-400" />
             <h3 className="mt-4 text-lg font-semibold text-gray-900">
-              Request Global {requestMethod.toUpperCase()} Explanation
+              Request Global {cfg.label} Explanation
             </h3>
             <p className="mt-2 text-sm text-gray-600 max-w-lg mx-auto">
-              Upload a background dataset (CSV) to compute feature importance across the model.
-              This dataset should be representative of the data your model was trained on or typical inference data.
+              Upload a background CSV dataset representative of your training data.
             </p>
             <div className="mt-6 flex justify-center">
               <label className="cursor-pointer">
@@ -259,9 +307,9 @@ export default function GlobalExplanationPage() {
             {backgroundFile && (
               <div className="mt-4">
                 <button
-                  onClick={handleRequest}
+                  onClick={() => requestGlobal.mutate()}
                   disabled={requestGlobal.isPending}
-                  className="inline-flex items-center rounded-lg bg-indigo-600 px-6 py-2.5 text-sm font-medium text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="inline-flex items-center rounded-lg bg-indigo-600 px-6 py-2.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {requestGlobal.isPending ? (
                     <>
@@ -278,6 +326,16 @@ export default function GlobalExplanationPage() {
         </div>
       )}
 
+      {/* Polling / loading state after triggering */}
+      {!explanation && explanationLoading && (
+        <div className="flex h-40 items-center justify-center border-2 border-dashed border-gray-200 rounded-lg bg-gray-50">
+          <div className="text-center">
+            <Loader2 className="mx-auto h-8 w-8 animate-spin text-indigo-500" />
+            <p className="mt-3 text-sm text-gray-600">Computing {cfg.label} explanation…</p>
+          </div>
+        </div>
+      )}
+
       {/* Error state */}
       {explanationError && !requestGlobal.isPending && (
         <div className="rounded-lg border border-red-200 bg-red-50 p-4 flex items-start">
@@ -285,20 +343,15 @@ export default function GlobalExplanationPage() {
           <div>
             <h4 className="text-sm font-medium text-red-800">Failed to load explanation</h4>
             <p className="mt-1 text-sm text-red-700">
-              {(explanationError as any).response?.data?.detail || 'An error occurred while fetching the explanation.'}
+              {(explanationError as any).response?.data?.detail ||
+                'An error occurred while fetching the explanation.'}
             </p>
-            {requestMethod === 'shap' ? (
-              <button
-                onClick={() => refetchExplanation()}
-                className="mt-2 text-sm font-medium text-red-600 hover:text-red-500"
-              >
-                Retry
-              </button>
-            ) : (
-              <p className="mt-2 text-sm text-red-600">
-                Please upload background data again and request a new computation.
-              </p>
-            )}
+            <button
+              onClick={() => refetchExplanation()}
+              className="mt-2 text-sm font-medium text-red-600 hover:text-red-500"
+            >
+              Retry
+            </button>
           </div>
         </div>
       )}
@@ -312,7 +365,7 @@ export default function GlobalExplanationPage() {
               <CheckCircle className="h-5 w-5 text-green-600" />
               <div>
                 <p className="text-sm font-medium text-green-800">
-                  {requestMethod.toUpperCase()} explanation ready
+                  {cfg.label} explanation ready
                 </p>
                 <p className="text-xs text-green-700">
                   Generated: {format(new Date(explanation.created_at), 'MMM d, yyyy HH:mm')}
@@ -320,30 +373,21 @@ export default function GlobalExplanationPage() {
               </div>
             </div>
             <div className="text-sm font-mono text-green-700">
-              ID: {explanation._id.slice(0, 8)}...
+              ID: {explanation._id.slice(0, 8)}…
             </div>
           </div>
 
-          {/* Feature Importance Bar Chart */}
-          {explanation.global_importance && explanation.global_importance.length > 0 && (
+          {/* ── Feature Importance Bar (SHAP / LIME / InterpretML) ─────────── */}
+          {featureImportanceData && featureImportanceData.length > 0 && (
             <FeatureImportanceBar
-              data={explanation.global_importance}
-              title={`Global Feature Importance (${requestMethod.toUpperCase()})`}
+              data={featureImportanceData}
+              title={`Global Feature Importance (${cfg.label})`}
               height={400}
-              color={requestMethod === 'shap' ? '#3b82f6' : '#8b5cf6'}
+              color={cfg.color}
             />
           )}
 
-          {explanation.lime_global_importance && explanation.lime_global_importance.length > 0 && (
-            <FeatureImportanceBar
-              data={explanation.lime_global_importance}
-              title={`Global Feature Importance (LIME)`}
-              height={400}
-              color="#8b5cf6"
-            />
-          )}
-
-          {/* Beeswarm plot for SHAP */}
+          {/* ── SHAP-only: Beeswarm ───────────────────────────────────────── */}
           {requestMethod === 'shap' && explanation.shap_values && (
             <SHAPBeeswarm
               shapValues={explanation.shap_values}
@@ -353,18 +397,19 @@ export default function GlobalExplanationPage() {
             />
           )}
 
-          {/* SHAP Dependence Plot */}
+          {/* ── SHAP-only: Dependence plots ───────────────────────────────── */}
           {requestMethod === 'shap' && explanation.feature_names && (
             <div className="rounded-lg border border-gray-200 bg-white p-6">
               <div className="mb-4">
-                <h3 className="text-lg font-semibold text-gray-900 mb餐2">SHAP Dependence Plots</h3>
+                <h3 className="text-lg font-semibold text-gray-900 mb-2">SHAP Dependence Plots</h3>
                 <p className="text-sm text-gray-600 mb-4">
-                  Visualize how a specific feature influences model predictions. Upload a background dataset and select a feature to see the relationship.
+                  Visualize how a specific feature influences model predictions.
                 </p>
-
                 <div className="flex flex-wrap items-end gap-4">
                   <div className="min-w-64">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Select Feature</label>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Select Feature
+                    </label>
                     <div className="relative">
                       <select
                         value={selectedFeature}
@@ -373,8 +418,8 @@ export default function GlobalExplanationPage() {
                         disabled={isLoadingDependence}
                       >
                         <option value="">-- Choose a feature --</option>
-                        {explanation.feature_names.map((feature: string) => (
-                          <option key={feature} value={feature}>{feature}</option>
+                        {explanation.feature_names.map((f: string) => (
+                          <option key={f} value={f}>{f}</option>
                         ))}
                       </select>
                       <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500 pointer-events-none" />
@@ -382,7 +427,9 @@ export default function GlobalExplanationPage() {
                   </div>
 
                   <div className="flex-1 min-w-80">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Background Dataset (CSV)</label>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Background Dataset (CSV)
+                    </label>
                     <label className="cursor-pointer inline-flex items-center px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50">
                       <Upload className="mr-2 h-4 w-4" />
                       {dependenceFeatureFile ? dependenceFeatureFile.name : 'Upload CSV'}
@@ -404,7 +451,7 @@ export default function GlobalExplanationPage() {
                     {isLoadingDependence ? (
                       <>
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        Loading...
+                        Loading…
                       </>
                     ) : (
                       <>
@@ -426,20 +473,35 @@ export default function GlobalExplanationPage() {
                   />
                   <p className="text-xs text-gray-500 mt-2 text-center">
                     Each point represents a sample from the background dataset.
-                    Red points indicate positive SHAP values (increasing prediction),
-                    blue points indicate negative SHAP values (decreasing prediction).
                   </p>
                 </div>
               )}
             </div>
           )}
 
-          {/* Background data info */}
+          {/* ── Alibi ─────────────────────────────────────────────────────── */}
+          {requestMethod === 'alibi' && explanation.explanation_data && (
+            <AlibiRuleDisplay
+              explanationData={explanation.explanation_data as any}
+              title="Alibi Explain — Global Anchor/ALE"
+            />
+          )}
+
+          {/* ── AIX360 ───────────────────────────────────────────────────── */}
+          {requestMethod === 'aix360' && explanation.explanation_data && (
+            <AIX360RuleDisplay
+              explanationData={explanation.explanation_data as any}
+              title="AIX360 — Global Boolean Rules"
+            />
+          )}
+
+          {/* About panel */}
           <div className="rounded-lg border border-gray-200 bg-white p-4">
             <h3 className="text-sm font-semibold text-gray-900 mb-2">About this analysis</h3>
             <p className="text-sm text-gray-600">
-              This {requestMethod} global explanation was computed on a background dataset of samples.
-              The importance scores represent the average absolute impact of each feature on the model's predictions across the dataset.
+              This {cfg.label} global explanation shows the overall importance of each feature
+              across the background dataset. Features with higher scores have a greater influence
+              on the model's predictions on average.
             </p>
           </div>
         </div>
