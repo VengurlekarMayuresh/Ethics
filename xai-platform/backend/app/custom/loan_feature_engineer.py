@@ -46,12 +46,31 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
 
     def __init__(self):
         self.raw_feature_names = None
+        # Define derived features for identification
+        self.derived_features = [
+            'Total_Income',
+            'ApplicantIncomeLog',
+            'CoapplicantIncomeLog',
+            'LoanAmountLog',
+            'Loan_Amount_Term_Log',
+            'Total_IncomeLog'
+        ]
 
     def fit(self, X, y=None):
         """Store raw feature names for schema extraction."""
         if hasattr(X, 'columns'):
             self.raw_feature_names = list(X.columns)
+        else:
+            # Fallback to class defaults if fit with numpy array
+            self.raw_feature_names = self.numeric_features + self.categorical_features
         return self
+
+    def get_feature_names_out(self, input_features=None):
+        """Standard sklearn method for feature names after transformation."""
+        raw = input_features if input_features is not None else self.raw_feature_names
+        if raw is None:
+            raw = self.numeric_features + self.categorical_features
+        return list(raw) + self.derived_features
 
     def transform(self, X):
         """
@@ -68,17 +87,23 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         else:
             X_df = X.copy()
 
-        # Ensure all numeric features exist
+        # Ensure all numeric features exist and are of numeric type
+        # This is critical for SHAP which may pass mixed-type numpy arrays
         for col in self.numeric_features:
             if col not in X_df.columns:
                 raise ValueError(f"Missing required feature: {col}")
+            X_df[col] = pd.to_numeric(X_df[col], errors='coerce')
 
         # Create derived features
         X_df['Total_Income'] = X_df['ApplicantIncome'] + X_df['CoapplicantIncome']
-        X_df['ApplicantIncomeLog'] = np.log1p(X_df['ApplicantIncome'])
-        X_df['CoapplicantIncomeLog'] = np.log1p(X_df['CoapplicantIncome'])
-        X_df['LoanAmountLog'] = np.log1p(X_df['LoanAmount'])
-        X_df['Loan_Amount_Term_Log'] = np.log1p(X_df['Loan_Amount_Term'])
-        X_df['Total_IncomeLog'] = np.log1p(X_df['Total_Income'])
+        
+        # Ensure Total_Income is also numeric before log transforms
+        X_df['Total_Income'] = pd.to_numeric(X_df['Total_Income'], errors='coerce')
+        
+        X_df['ApplicantIncomeLog'] = np.log1p(X_df['ApplicantIncome'].astype(float))
+        X_df['CoapplicantIncomeLog'] = np.log1p(X_df['CoapplicantIncome'].astype(float))
+        X_df['LoanAmountLog'] = np.log1p(X_df['LoanAmount'].astype(float))
+        X_df['Loan_Amount_Term_Log'] = np.log1p(X_df['Loan_Amount_Term'].astype(float))
+        X_df['Total_IncomeLog'] = np.log1p(X_df['Total_Income'].astype(float))
 
         return X_df

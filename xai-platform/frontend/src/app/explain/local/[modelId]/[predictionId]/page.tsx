@@ -57,9 +57,10 @@ interface LocalExplanation {
   expected_value?: number;
   feature_names?: string[];
   // LIME
-  lime_weights?: any[];
-  lime_intercept?: number;
-  lime_local_pred?: number;
+  lime_weights?: Array<{ feature: string; weight: number }> | any[];
+  lime_intercept?: number | Record<string, number>;
+  lime_local_pred?: number | number[];
+  explained_class?: string;
   // New frameworks
   explanation_data?: Record<string, any>;
   created_at?: string;
@@ -767,12 +768,43 @@ export default function UnifiedExplanationPage() {
                 );
               }
 
+              // Normalize lime_weights: backend now returns [{feature, weight}]
+              const limeWeights = (localLime.lime_weights || []).map((item: any) => {
+                if (typeof item === 'object' && 'feature' in item && 'weight' in item) {
+                  return { feature: String(item.feature), weight: Number(item.weight) };
+                }
+                // Legacy format: [feature_str, weight_num] tuple
+                if (Array.isArray(item)) {
+                  return { feature: String(item[0]), weight: Number(item[1]) };
+                }
+                return { feature: String(item), weight: 0 };
+              });
+
+              // Normalize intercept: backend returns {"1": 0.42} → grab first value
+              const rawIntercept = localLime.lime_intercept;
+              const interceptNum: number | undefined =
+                typeof rawIntercept === 'number'
+                  ? rawIntercept
+                  : rawIntercept && typeof rawIntercept === 'object'
+                    ? Number(Object.values(rawIntercept)[0])
+                    : undefined;
+
+              // Normalize localPred: backend returns [0.37] → grab first value
+              const rawLocalPred = localLime.lime_local_pred;
+              const localPredNum: number | undefined =
+                typeof rawLocalPred === 'number'
+                  ? rawLocalPred
+                  : Array.isArray(rawLocalPred) && rawLocalPred.length > 0
+                    ? Number(rawLocalPred[0])
+                    : undefined;
+
               return (
                 <div key={tab.id}>
                   <LIMEPlot
-                    data={localLime.lime_weights || []}
-                    intercept={localLime.lime_intercept}
-                    localPred={localLime.lime_local_pred}
+                    data={limeWeights}
+                    intercept={interceptNum}
+                    localPred={localPredNum}
+                    explainedClass={localLime.explained_class}
                     title="LIME Feature Contributions"
                     height={400}
                   />
