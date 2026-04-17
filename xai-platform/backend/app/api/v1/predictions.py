@@ -69,6 +69,7 @@ async def predict(
             "input_data": input_dict,
             "prediction": formatted_result["prediction"],
             "probability": formatted_result["probabilities"],
+            "prediction_confidence": formatted_result.get("prediction_confidence", 0.0),
             "latency_ms": 0,  # TODO: Add timing
             "created_at": datetime.utcnow()
         }
