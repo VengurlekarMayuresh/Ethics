@@ -45,12 +45,9 @@ class InterpretMLService:
 
     @staticmethod
     def explain_instance(
-        explainer: Any,
-        model,
+        explainer_obj: Any,
         instance: np.ndarray,
-        num_features: int = 10,
-        num_samples: int = 5000,
-        raw_instance: Optional[np.ndarray] = None
+        feature_names: List[str]
     ) -> Dict[str, Any]:
         """
         Generate InterpretML explanation for a single instance.
@@ -71,7 +68,8 @@ class InterpretMLService:
         # This is a stub for the actual interpret.blackbox local method.
         # e.g., local_exp = explainer.explain_local(instance)
         
-        feature_names = explainer.get('feature_names', [f"feature_{i}" for i in range(len(instance))])
+        feature_names = explainer_obj.get('feature_names', [f"feature_{i}" for i in range(len(instance))])
+        num_features = len(feature_names)
         
         # Generate dummy contributions based on instance values
         contributions = []
@@ -90,7 +88,11 @@ class InterpretMLService:
             "intercept": 0.0,
             "local_exp": {"0": [{"feature": c["feature"], "weight": c["weight"]} for c in contributions]},
             "local_pred": float(np.random.normal(100, 10)),
-            "list_of_contributions": sorted(contributions, key=lambda x: abs(x["weight"]), reverse=True)
+            "list_of_contributions": sorted(contributions, key=lambda x: abs(x["weight"]), reverse=True),
+            "feature_importance": [
+                {"feature": c["feature"], "importance": abs(c["weight"])}
+                for c in contributions
+            ]
         }
         
         return explanation_data
