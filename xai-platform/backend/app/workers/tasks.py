@@ -15,6 +15,8 @@ import pickle
 import joblib
 from sklearn.pipeline import Pipeline
 import traceback
+import importlib
+import io
 
 # Maximum number of background samples to use for global SHAP/LIME explanations
 # Prevents extremely long computation times with large datasets
@@ -188,13 +190,58 @@ def compute_shap_values(self, prediction_id: str, model_id: str) -> Dict[str, An
                         if isinstance(inp, dict):
                             recent_inputs.append(inp)
 
-                    if len(recent_inputs) >= 2:
+                    if len(recent_inputs) >= 5:
                         background_data = pd.DataFrame(recent_inputs)
                         # Keep column order aligned with current input.
                         background_data = background_data.reindex(columns=input_data.columns, fill_value=np.nan)
                         logger.info(f"[compute_shap_values] Built background from recent predictions: shape={background_data.shape}")
                     else:
-                        logger.warning(f"[compute_shap_values] Not enough recent predictions ({len(recent_inputs)}), will use input_data as background")
+                        # Fallback: create synthetic baseline if not enough history
+                        logger.warning(f"[compute_shap_values] Not enough recent predictions ({len(recent_inputs)}), building synthetic baseline from schema")
+                        
+                        synthetic_rows = []
+                        feature_schema = model.get("feature_schema", [])
+                        
+                        def get_baseline_val(fs):
+                            # Prioritize schema-defined mean/median, else use zero for numeric
+                            if fs.get("type") == "numeric":
+                                if fs.get("mean") is not None: return float(fs["mean"])
+                                if fs.get("mean_") is not None: return float(fs["mean_"]) # common typo in older dumps
+                                return 0.0
+                            else:
+                                # Categorical: use mode if exists, else first option, else empty string
+                                options = fs.get("options", [])
+                                return options[0] if options else ""
+                        
+                        # Row 1: The "Average" person
+                        medoid = {fs["name"]: get_baseline_val(fs) for fs in feature_schema if fs["name"] in input_data.columns}
+                        synthetic_rows.append(medoid)
+                        
+                        # Row 2: Perturbed version of input data to ensure variety in every column
+                        # This helps ensure KernelExplainer sees at least some distribution.
+                        baseline_2 = medoid.copy()
+                        for fs in feature_schema:
+                            name = fs["name"]
+                            if name not in input_data.columns: continue
+                            val = input_data.iloc[0][name]
+                            if fs.get("type") == "numeric":
+                                # If input is same as baseline, add slight noise
+                                if abs(val - baseline_2[name]) < 1e-6:
+                                    baseline_2[name] = val + 1.0 # arbitrary shift
+                            else:
+                                options = fs.get("options", [])
+                                if len(options) > 1 and val == baseline_2[name]:
+                                    baseline_2[name] = options[1] # swap to second option
+                        
+                        synthetic_rows.append(baseline_2)
+                        
+                        # If we had some recent predictions but < 5, add them too
+                        if recent_inputs:
+                            synthetic_rows.extend(recent_inputs[:3])
+
+                        background_data = pd.DataFrame(synthetic_rows)
+                        background_data = background_data.reindex(columns=input_data.columns, fill_value=np.nan)
+                        logger.info(f"[compute_shap_values] Generated synthetic background: shape={background_data.shape}")
 
                 logger.info(f"[compute_shap_values] Calling _compute_shap: input_data.shape={input_data.shape}, background_data shape={background_data.shape if background_data is not None else 'None'}")
                 shap_values, expected_value, feature_names = _compute_shap(model_obj, framework, input_data, background_data)
@@ -511,54 +558,76 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             self.update_state(state="PROGRESS", meta={"status": "creating LIME explainer", "progress": 50})
 
             # Create explainer — training_df now has same columns as input_df
+            raw_feature_names = [fs['name'] for fs in model.get('feature_schema', [])]
             explainer = LIMEService.create_explainer(
                 model_obj,
-                framework,
                 training_df,
-                list(training_df.columns),
-                mode=mode
+                mode=mode,
+                raw_feature_names=raw_feature_names
             )
             logger.info(f"[compute_lime_values] Explainer created. feature_names count={len(getattr(explainer, 'feature_names', []))}")
 
             # Get feature names from explainer
             explainer_feature_names = getattr(explainer, 'feature_names', list(training_df.columns))
 
-            # Input instance (same columns as training_df)
-            input_values = input_df[list(training_df.columns)].values[0]
-            logger.info(f"[compute_lime_values] Input instance shape: {input_values.shape}")
+            # Input instance (same columns as training_df) as 1-row DataFrame
+            instance_to_explain = input_df[list(training_df.columns)].iloc[0:1]
+            logger.info(f"[compute_lime_values] Input instance shape: {instance_to_explain.shape}")
 
             # For pipelines: do NOT preprocess the instance.
             # The LIME explainer operates in the ORIGINAL feature space.
             # We wrap the full pipeline's predict_proba as the prediction function,
             # so LIME perturbs in original feature space → pipeline handles encoding internally.
-            instance_to_explain = input_values  # always original feature space
-
             if isinstance(model_obj, Pipeline):
-                logger.info(f"[compute_lime_values] Pipeline detected: LIME will use original {len(input_values)}-feature space with full pipeline predict_proba")
-                # Re-create the explainer using the original training_df (7 features) with
-                # the FULL pipeline as predict_fn — this is already what create_explainer does
-                # when given a Pipeline, so nothing extra needed here.
-                instance_to_explain = input_values  # keep original, no preprocessing
+                logger.info(f"[compute_lime_values] Pipeline detected: LIME will use original {instance_to_explain.shape[1]}-feature space with full pipeline predict_proba")
 
             self.update_state(state="PROGRESS", meta={"status": "computing LIME values", "progress": 70})
 
             # Compute LIME explanation
+            # Use high num_features to ensure all features are shown as requested by user
+            max_feat_count = len(explainer_feature_names)
+            requested_num = max(num_features or 10, max_feat_count)
+            
             try:
                 lime_data = LIMEService.explain_instance(
                     explainer,
                     model_obj,
                     instance_to_explain,
-                    num_features=num_features
+                    num_features=requested_num
                 )
-                logger.info(f"[compute_lime_values] explain_instance returned: list_of_contributions count={len(lime_data.get('list_of_contributions', []))}")
+                logger.info(f"[compute_lime_values] explain_instance returned: explanation count={len(lime_data.get('explanation', []))}")
             except Exception as lime_err:
                 logger.error(f"[compute_lime_values] LIMEService.explain_instance FAILED: {type(lime_err).__name__}: {lime_err}")
                 logger.error(f"[compute_lime_values] Full traceback:\n{traceback.format_exc()}")
                 raise
 
-            contributions = lime_data.get("list_of_contributions", [])
+            # ── Sanitize LIME output for MongoDB (BSON requires string keys) ──
+            # Extract raw explanation: list of (feature_str, float) tuples
+            contributions = lime_data.get("explanation", [])
             if not contributions:
-                logger.warning(f"[compute_lime_values] list_of_contributions is EMPTY. lime_data keys: {list(lime_data.keys())}. local_exp: {lime_data.get('local_exp', {})}")
+                logger.warning(f"[compute_lime_values] explanation is EMPTY. lime_data keys: {list(lime_data.keys())}")
+
+            # contributions: list of (feature_str, float) tuples → serialize as list of dicts
+            contributions_safe = [
+                {"feature": str(feat), "weight": float(w)}
+                for feat, w in contributions
+            ] if contributions else []
+
+            # intercept: LIME returns {class_int: float} → convert keys to strings
+            raw_intercept = lime_data.get("intercept", {})
+            if isinstance(raw_intercept, dict):
+                intercept_safe = {str(k): float(v) for k, v in raw_intercept.items()}
+            else:
+                intercept_safe = float(raw_intercept) if raw_intercept is not None else None
+
+            # actual_prediction: true pipeline probabilities (list of floats per class)
+            raw_actual_pred = lime_data.get("actual_prediction")
+            if hasattr(raw_actual_pred, "tolist"):
+                local_pred_safe = raw_actual_pred.tolist()
+            elif isinstance(raw_actual_pred, (list, tuple)):
+                local_pred_safe = [float(v) for v in raw_actual_pred]
+            else:
+                local_pred_safe = float(raw_actual_pred) if raw_actual_pred is not None else None
 
             self.update_state(state="PROGRESS", meta={"status": "saving results", "progress": 90})
 
@@ -568,10 +637,12 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
                 "model_id": model_id,
                 "method": "lime",
                 "explanation_type": "local",
-                "lime_weights": contributions,
-                "lime_intercept": lime_data.get("intercept"),
-                "lime_local_pred": lime_data.get("local_pred"),
-                "feature_names": explainer_feature_names,
+                "lime_weights": contributions_safe,
+                "lime_intercept": intercept_safe,
+                "lime_local_pred": local_pred_safe,
+                "explained_class": lime_data.get("explained_class"),
+                "explained_class_index": lime_data.get("explained_class_index"),
+                "feature_names": [str(f) for f in explainer_feature_names],
                 "nl_explanation": None,
                 "task_id": self.request.id,
                 "task_status": "complete",
@@ -639,9 +710,7 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
             # Create explainer (will preprocess background data if pipeline)
             explainer = LIMEService.create_explainer(
                 model_obj,
-                framework,
                 background_df,
-                list(background_df.columns),
                 mode=mode
             )
 
@@ -650,22 +719,8 @@ def compute_global_lime(self, model_id: str, background_data_path: Optional[str]
 
             self.update_state(state="PROGRESS", meta={"status": "computing global LIME", "progress": 60})
 
-            # For global LIME, the samples passed to explain_global must be in the same space as the explainer.
-            # If pipeline, preprocess background_df; otherwise use as-is.
+            # For global LIME, we pass raw data directly; explain_global calls explain_instance which handles the Pipeline.
             samples_for_explanation = background_df
-            if isinstance(model_obj, Pipeline):
-                # Preprocess to numeric space
-                preprocessor = None
-                for step_name, step_obj in model_obj.steps:
-                    if hasattr(step_obj, 'transform'):
-                        preprocessor = step_obj
-                        break
-                if preprocessor is not None:
-                    processed_bg = preprocessor.transform(background_df)
-                    if hasattr(processed_bg, 'toarray'):
-                        processed_bg = processed_bg.toarray()
-                    # Convert to DataFrame with feature names from explainer
-                    samples_for_explanation = pd.DataFrame(processed_bg, columns=explainer_feature_names)
 
             # Compute aggregated LIME importance
             lime_global = LIMEService.explain_global(
@@ -789,145 +844,161 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
 
         # Check if model is a sklearn Pipeline
         if isinstance(model_obj, Pipeline):
-            logger.info("[_compute_shap] Model is a Pipeline - preprocessing required")
-            # For pipelines, we need to preprocess data using all transformer steps before the final estimator.
-            # This handles pipelines with multiple preprocessing steps (e.g., FeatureEngineer + ColumnTransformer).
-            from sklearn.pipeline import Pipeline
-            # Build a composite preprocessor from all steps except the final estimator.
-            preprocessor = Pipeline(model_obj.steps[:-1])
-            final_estimator = model_obj.steps[-1][1]
-            logger.info(f"[_compute_shap] Final estimator: {type(final_estimator).__name__}")
+            logger.info("[_compute_shap] Model is a Pipeline - explaining ORIGINAL feature space for perfect mapping")
+            
+            # For Pipelines, we prefer explaining the ORIGINAL features (the inputs to the whole pipeline)
+            # This ensures we get exactly 11 SHAP values matching the 11 input features,
+            # avoiding internal complexity like derived features and one-hot encoding in the graph.
+            
+            predict_fn_full = model_obj.predict_proba if hasattr(model_obj, 'predict_proba') else model_obj.predict
 
-            # Also find the step that expands features (e.g., ColumnTransformer with OneHotEncoder)
-            # This is needed to aggregate one-hot encoded SHAP values back to original categorical features.
-            feature_expander = None
-            for step_name, step_obj in preprocessor.steps:
-                if hasattr(step_obj, 'transformers_'):
-                    feature_expander = step_obj
-                    break
+            def _predict_full_pipeline(values):
+                """Wraps full pipeline predict for SHAP sampling in original feature space."""
+                # SHAP passes numpy arrays; we convert back to DataFrame for the pipeline
+                if isinstance(values, np.ndarray):
+                    df = pd.DataFrame(values, columns=expected_columns)
+                else:
+                    df = pd.DataFrame(values, columns=expected_columns)
+                return predict_fn_full(df)
 
-            # Determine final_feature_names from the preprocessor's last step that provides feature names
-            final_feature_names = expected_columns  # default fallback
-            # Try to get feature names from the last step that has get_feature_names_out
-            for step_name, step_obj in reversed(preprocessor.steps):
-                if hasattr(step_obj, 'get_feature_names_out'):
-                    try:
-                        # Some transformers (like ColumnTransformer) may use feature_names_in_
-                        if hasattr(step_obj, 'feature_names_in_'):
-                            input_features = step_obj.feature_names_in_
-                            raw_names = step_obj.get_feature_names_out(input_features=input_features)
-                        else:
-                            raw_names = step_obj.get_feature_names_out()
-                        # Clean up names: remove transformer prefix like 'cat__' or 'num__'
-                        cleaned_names = []
-                        for name in raw_names:
-                            if isinstance(name, bytes):
-                                name = name.decode('utf-8')
-                            if '__' in name:
-                                name = name.split('__', 1)[1]
-                            cleaned_names.append(name)
-                        final_feature_names = cleaned_names
-                        logger.info(f"[_compute_shap] Extracted {len(final_feature_names)} feature names from preprocessor step '{step_name}'")
-                        break
-                    except Exception as e:
-                        logger.debug(f"[_compute_shap] Could not get feature names from step '{step_name}': {e}")
-                        continue
-
-            # Prepare background data (raw) - align columns, use FULL background if available
+            # Prepare background data (raw)
             if background_data is not None and len(background_data) > 0:
-                logger.info(f"[_compute_shap] Preparing background data: shape={background_data.shape}")
-                bg = _prepare_background(background_data)  # use full dataset
+                bg_raw = _prepare_background(background_data)
             else:
-                logger.info("[_compute_shap] No background data provided, using input_data as background")
-                bg = _prepare_background(input_data)
-            logger.info(f"[_compute_shap] Background data prepared: shape={bg.shape}")
+                bg_raw = _prepare_background(input_data)
+            
+            # Cap background for performance (KernelExplainer is slow on large backgrounds)
+            bg_capped = bg_raw.iloc[:30] if len(bg_raw) > 30 else bg_raw
+            
+            np.random.seed(42)
+            logger.info(f"[_compute_shap] Initializing KernelExplainer on {len(expected_columns)} original features. Background shape: {bg_capped.shape}")
+            explainer = shap.KernelExplainer(_predict_full_pipeline, bg_capped.values)
+            
+            # Predict the instance to be explained
+            shap_values = explainer.shap_values(input_data.values)
+            expected_value = explainer.expected_value
+            final_feature_names = expected_columns
+            
+            # Detailed Logging
+            # Detailed Logging of raw SHAP output
+            logger.info(f"[_compute_shap] Raw shap_values type: {type(shap_values)}")
+            if isinstance(shap_values, list):
+                logger.info(f"[_compute_shap]   List length: {len(shap_values)}")
+                if len(shap_values) > 0:
+                    logger.info(f"[_compute_shap]   First element shape: {getattr(shap_values[0], 'shape', 'N/A')}")
+            elif hasattr(shap_values, 'shape'):
+                logger.info(f"[_compute_shap]   Array shape: {shap_values.shape}")
 
-            # --------------------------------------------------------
-            # For pipelines, we must preprocess data and use final estimator
-            # Try TreeExplainer first if final estimator is tree-based (FAST)
-            # --------------------------------------------------------
-            # Preprocess background data
-            if len(bg) > MAX_GLOBAL_SHAP_SAMPLES:
-                # For large datasets, sample to avoid memory issues with KernelExplainer
-                logger.info(f"[_compute_shap] Background data size ({len(bg)}) exceeds MAX_GLOBAL_SHAP_SAMPLES ({MAX_GLOBAL_SHAP_SAMPLES}), sampling")
-                bg_capped = bg.sample(n=MAX_GLOBAL_SHAP_SAMPLES, random_state=42)
-            else:
-                bg_capped = bg
-            logger.info(f"[_compute_shap] Background data after capping: shape={bg_capped.shape}")
-
-            # Preprocess to numeric space
-            if preprocessor is not None:
-                logger.debug("[_compute_shap] Transforming background data with preprocessor")
-                bg_processed = preprocessor.transform(bg_capped)
-                if hasattr(bg_processed, 'toarray'):  # sparse matrix
-                    bg_processed = bg_processed.toarray()
-                bg_numeric = np.asarray(bg_processed, dtype=float)
-            else:
-                logger.debug("[_compute_shap] No preprocessor, converting background to numeric via .values")
-                bg_numeric = bg_capped.values.astype(float)
-            logger.info(f"[_compute_shap] Background numeric shape: {bg_numeric.shape}, dtype={bg_numeric.dtype}")
-            logger.debug(f"[_compute_shap] Background numeric sample (first row, first 5): {bg_numeric[0, :5] if bg_numeric.shape[0] > 0 else 'empty'}")
-
-            # Preprocess full input data
-            if preprocessor is not None:
-                logger.debug(f"[_compute_shap] Transforming input data ({input_data.shape}) with preprocessor")
-                input_processed = preprocessor.transform(input_data)
-                if hasattr(input_processed, 'toarray'):
-                    input_processed = input_processed.toarray()
-                input_numeric = np.asarray(input_processed, dtype=float)
-            else:
-                logger.debug("[_compute_shap] No preprocessor, converting input to numeric via .values")
-                input_numeric = input_data.values.astype(float)
-            logger.info(f"[_compute_shap] Input numeric shape: {input_numeric.shape}, dtype={input_numeric.dtype}")
-
-            # Use shap.Explainer for auto-detection of optimal explainer
-            # This automatically picks LinearExplainer, TreeExplainer, or KernelExplainer
-            shap_values = None
-            expected_value = None
+            # ========================================================
+            # SYSTEMATIC EXTRACTION V3 (EXTREME DIAGNOSTICS)
+            # ========================================================
             try:
-                logger.info("[_compute_shap] Attempting shap.Explainer (auto-detect) with check_additivity=False")
-                explainer = shap.Explainer(final_estimator, bg_numeric, check_additivity=False)
-                shap_values = explainer(input_numeric)
-                expected_value = explainer.expected_value
-                logger.info(f"[_compute_shap] shap.Explainer succeeded: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}")
-                # Convert shap.Explanation to raw array if needed
-                if hasattr(shap_values, 'values'):
-                    shap_values = shap_values.values
-                    logger.debug(f"[_compute_shap] Converted shap.Explanation to values array: shape={shap_values.shape if hasattr(shap_values, 'shape') else 'N/A'}")
-            except Exception as e:
-                logger.warning(f"[_compute_shap] shap.Explainer failed: {e}, falling back to TreeExplainer")
-                # Auto-detect failed, fallback to manual TreeExplainer
-                try:
-                    logger.info("[_compute_shap] Trying shap.TreeExplainer with check_additivity=False")
-                    explainer = shap.TreeExplainer(final_estimator, bg_numeric, check_additivity=False)
-                    shap_values = explainer.shap_values(input_numeric)
-                    expected_value = explainer.expected_value
-                    logger.info(f"[_compute_shap] TreeExplainer succeeded: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}")
-                except Exception as e2:
-                    logger.warning(f"[_compute_shap] TreeExplainer failed: {e2}, falling back to KernelExplainer on ORIGINAL feature space")
-                    # CRITICAL: Do NOT use KernelExplainer on bg_numeric (1317 features) — too slow.
-                    # Instead, use the FULL PIPELINE as predict_fn and operate on the ORIGINAL feature space.
-                    # This gives SHAP values on the 7 original features, which is much faster.
-                    predict_fn_full = model_obj.predict_proba if hasattr(model_obj, 'predict_proba') else model_obj.predict
+                # 1. LOG PIPELINE INPUT INFO
+                logger.info(f"[_compute_shap] V3 DIAG: expected_columns count={len(expected_columns)}")
+                logger.info(f"[_compute_shap] V3 DIAG: input_data.shape={input_data.shape}")
+                logger.info(f"[_compute_shap] V3 DIAG: bg_capped.shape={bg_capped.shape}")
+                
+                # 2. LOG RAW SHAP INFO
+                logger.info(f"[_compute_shap] V3 DIAG: RAW TYPE={type(shap_values)}")
+                if isinstance(shap_values, list):
+                    logger.info(f"[_compute_shap] V3 DIAG: LIST LEN={len(shap_values)}")
+                    for i, v in enumerate(shap_values):
+                        logger.info(f"[_compute_shap] V3 DIAG:   Item {i} shape={getattr(v, 'shape', 'N/A')}")
+                else:
+                    logger.info(f"[_compute_shap] V3 DIAG: ARRAY SHAPE={getattr(shap_values, 'shape', 'N/A')}")
 
-                    def _predict_full_pipeline(values):
-                        """Wraps full pipeline predict for SHAP sampling in original feature space."""
-                        if isinstance(values, np.ndarray):
-                            df = pd.DataFrame(values, columns=expected_columns)
-                        else:
-                            df = pd.DataFrame(values, columns=expected_columns)
-                        return predict_fn_full(df)
+                # 3. ROBUST STACKING
+                if isinstance(shap_values, list):
+                    # Ensure all are arrays
+                    s_arr = np.array([np.asarray(v) for v in shap_values])
+                else:
+                    s_arr = np.asarray(shap_values)
+                
+                logger.info(f"[_compute_shap] V3 DIAG: STACKED_ARR.SHAPE={s_arr.shape}")
 
-                    # Use the raw (original) background, capped to 20 rows to keep KernelExplainer fast.
-                    bg_raw_for_kernel = bg_capped.iloc[:20] if len(bg_capped) > 20 else bg_capped
-                    np.random.seed(42)
-                    logger.info(f"[_compute_shap] KernelExplainer on ORIGINAL {len(expected_columns)}-feature space, bg_shape={bg_raw_for_kernel.shape}")
-                    explainer = shap.KernelExplainer(_predict_full_pipeline, bg_raw_for_kernel.values)
-                    shap_values = explainer.shap_values(input_data.values)
-                    expected_value = explainer.expected_value
-                    # feature names are now the ORIGINAL 7 columns, not the 1317 preprocessed ones
-                    final_feature_names = expected_columns
-                    logger.info(f"[_compute_shap] KernelExplainer (original space) completed: feature_names={len(final_feature_names)}")
+                # 4. FEATURE DIMENSION IDENTIFICATION
+                n_feat = len(expected_columns)
+                # Find which axis has size n_feat
+                feat_axis = -1
+                for ax, size in enumerate(s_arr.shape):
+                    if size == n_feat:
+                        feat_axis = ax
+                        break
+                
+                logger.info(f"[_compute_shap] V3 DIAG: Feature axis identified as {feat_axis}")
+
+                # 5. EXTRACTION
+                # We want a 1D vector of shape (n_feat,) for a specific class.
+                if s_arr.ndim == 3:
+                    # Case A: (classes, samples, features) -> Common in TreeExplainer
+                    if feat_axis == 2:
+                        c_idx = 1 if s_arr.shape[0] == 2 else 0
+                        instance_vals = s_arr[c_idx, 0, :]
+                        logger.info(f"[_compute_shap] V3 DIAG: Extracted from (classes, samples, features) using class={c_idx}")
+                    
+                    # Case B: (samples, features, classes) -> Common in KernelExplainer
+                    elif feat_axis == 1:
+                        # Third dimension is classes
+                        c_dim_size = s_arr.shape[2]
+                        c_idx = 1 if c_dim_size == 2 else 0
+                        instance_vals = s_arr[0, :, c_idx]
+                        logger.info(f"[_compute_shap] V3 DIAG: Extracted from (samples, features, classes) using class={c_idx}")
+                    
+                    else:
+                        # Fallback for other 3D shapes
+                        instance_vals = s_arr[0, 0, :] if s_arr.shape[2] == n_feat else s_arr[0, :, 0]
+                
+                elif s_arr.ndim == 2:
+                    # (samples, features) or (classes, features)
+                    if s_arr.shape[1] == n_feat:
+                        instance_vals = s_arr[0, :]
+                    else:
+                        instance_vals = s_arr[:, 0]
+                else:
+                    instance_vals = s_arr.flatten()
+
+                logger.info(f"[_compute_shap] V3 DIAG: FINAL instance_vals.shape={instance_vals.shape}")
+                if len(instance_vals) != n_feat:
+                    logger.warning(f"[_compute_shap] V3 DIAG: SHAPE MISMATCH! Expected {n_feat}, got {len(instance_vals)}")
+
+            except Exception as e_extract:
+                logger.error(f"[_compute_shap] EXTRACTION V3 FAILED: {e_extract}")
+                instance_vals = np.zeros(len(expected_columns))
+                raise ValueError(f"SHAP extraction V3 failed. Error: {e_extract}")
+
+            # 6. SYSTEMATIC REPORT V2 (REFASHIONED)
+            try:
+                from tabulate import tabulate
+                
+                report_data = []
+                for i, name in enumerate(final_feature_names):
+                    if i < len(instance_vals):
+                        try:
+                            v = instance_vals[i]
+                            f_val = float(np.asarray(v).flatten()[0])
+                            report_data.append([
+                                i, name, f"{f_val:+.6f}", abs(f_val),
+                                "POS" if f_val > 0 else ("NEG" if f_val < 0 else "ZERO")
+                            ])
+                        except:
+                            report_data.append([i, name, "ERR", 0, "FORMAT"])
+                    else:
+                        report_data.append([i, name, "MISSING", 0, "ERROR"])
+                
+                sorted_report = sorted(report_data, key=lambda x: x[3], reverse=True)
+                
+                logger.info("\n" + "@"*95 + "\n" +
+                            "  SYSTEMATIC SHAP EXPLANATION REPORT (GLOBAL COMPATIBLE)\n" +
+                            "@"*95 + f"\nExpected Base: {expected_value}\n" +
+                            f"Total Features: {len(expected_columns)}\n" +
+                            "-"*95 + "\n" +
+                            tabulate(sorted_report, headers=["Idx", "Feature Name", "Value", "Abs Impact", "Dir"], tablefmt="grid") +
+                            "\n" + "@"*95)
+            except Exception as e_log:
+                logger.warning(f"[_compute_shap] Logging V3 failed: {e_log}")
+            # ========================================================
+            
+            return shap_values, expected_value, final_feature_names
 
         else:
             # For non-pipeline models, use shap.Explainer for auto-detection
@@ -979,97 +1050,6 @@ def _compute_shap(model_obj, framework: str, input_data: pd.DataFrame, backgroun
                     shap_values = explainer.shap_values(input_data.values)
                     expected_value = explainer.expected_value
                     logger.info(f"[_compute_shap] KernelExplainer completed")
-
-        # ------------------------------------------------------------
-        # AGGREGATION: For pipelines with OneHotEncoder, combine one-hot
-        # encoded features back to original categorical features.
-        # The frontend expects a manageable number of features (original inputs),
-        # not hundreds of one-hot encoded columns.
-        # ------------------------------------------------------------
-        if isinstance(model_obj, Pipeline):
-            logger.debug("[_compute_shap] Checking for aggregation (OneHotEncoder)")
-            preprocessor = None
-            for step_name, step_obj in model_obj.steps:
-                if hasattr(step_obj, 'transform'):
-                    preprocessor = step_obj
-                    break
-
-            if feature_expander is not None:
-                # We have a feature expander (e.g., ColumnTransformer) that created one-hot encoded features
-                # Build mapping from original categorical feature to encoded column indices
-                from collections import defaultdict
-                original_to_encoded = defaultdict(list)
-                original_feature_names_set = set()
-
-                # feature_expander has transformers_ attribute
-                logger.debug(f"[_compute_shap] Feature expander has transformers_: {len(feature_expander.transformers_)} transformers")
-                for transformer_name, transformer_obj, cols in feature_expander.transformers_:
-                    transformer_class = transformer_obj.__class__.__name__
-                    logger.debug(f"[_compute_shap] Transformer: name={transformer_name}, class={transformer_class}, cols={cols}")
-                    for col in cols:
-                        original_feature_names_set.add(col)
-                        col_str = str(col)
-                        for idx, fname in enumerate(final_feature_names):
-                            if isinstance(fname, bytes):
-                                fname = fname.decode('utf-8')
-                            fname_str = str(fname)
-                            if '__' in fname_str:
-                                parts = fname_str.split('__', 1)
-                                norm_name = parts[1] if len(parts) == 2 else fname_str
-                            else:
-                                norm_name = fname_str
-                            if norm_name == col_str or norm_name.startswith(col_str + '_'):
-                                original_to_encoded[col].append(idx)
-
-                logger.info(f"[_compute_shap] Aggregation mapping built: {len(original_to_encoded)} original features mapped")
-                logger.debug(f"[_compute_shap] original_to_encoded keys (first 5): {list(original_to_encoded.keys())[:5]}")
-                for k, v in list(original_to_encoded.items())[:5]:
-                    logger.debug(f"[_compute_shap]   {k!r} -> indices {v}")
-
-                # If we found any grouping, aggregate
-                if original_to_encoded:
-                    logger.info(f"[_compute_shap] Starting aggregation: shap_values type={type(shap_values)}")
-                    n_samples = shap_values.shape[0] if hasattr(shap_values, 'shape') else len(shap_values)
-                    logger.debug(f"[_compute_shap] n_samples from shap_values: {n_samples}")
-                    # Ensure shap_values is 2D
-                    if isinstance(shap_values, list):
-                        logger.debug(f"[_compute_shap] shap_values is a list with {len(shap_values)} classes")
-                        if len(shap_values) > 0:
-                            if len(shap_values) == 2:
-                                class_idx = 1
-                            else:
-                                class_idx = 0
-                            shap_arr = np.asarray(shap_values[class_idx])
-                            logger.debug(f"[_compute_shap] Selected class_idx={class_idx}, shap_arr shape={shap_arr.shape}, ndim={shap_arr.ndim}")
-                            if shap_arr.ndim == 1:
-                                shap_arr = shap_arr.reshape(1, -1)
-                        else:
-                            shap_arr = np.array([])
-                    else:
-                        shap_arr = np.asarray(shap_values)
-                        logger.debug(f"[_compute_shap] shap_values is array: shape={shap_arr.shape}, ndim={shap_arr.ndim}")
-                        if shap_arr.ndim == 1:
-                            shap_arr = shap_arr.reshape(1, -1)
-
-                    if shap_arr.ndim == 2 and shap_arr.shape[0] > 0:
-                        # Create aggregated array
-                        orig_features_list = sorted(original_feature_names_set)
-                        logger.info(f"[_compute_shap] Aggregating: orig_features_list length={len(orig_features_list)}")
-                        aggregated_shap = np.zeros((shap_arr.shape[0], len(orig_features_list)), dtype=float)
-
-                        for agg_idx, orig_feat in enumerate(orig_features_list):
-                            encoded_indices = original_to_encoded.get(orig_feat, [])
-                            if len(encoded_indices) == 1:
-                                aggregated_shap[:, agg_idx] = shap_arr[:, encoded_indices[0]]
-                            elif len(encoded_indices) > 1:
-                                # Sum contributions from all encoded columns
-                                aggregated_shap[:, agg_idx] = shap_arr[:, encoded_indices].sum(axis=1)
-
-                        shap_values = aggregated_shap
-                        final_feature_names = orig_features_list
-                        logger.info(f"[_compute_shap] Aggregation complete: final shap_values shape={shap_values.shape}, final_feature_names count={len(final_feature_names)}")
-                    else:
-                        logger.warning(f"[_compute_shap] shap_arr is not 2D or has 0 samples, skipping aggregation")
 
         logger.info(f"[_compute_shap] RETURN: shap_values type={type(shap_values)}, expected_value type={type(expected_value)}, final_feature_names count={len(final_feature_names)}")
         return shap_values, expected_value, final_feature_names
@@ -1183,15 +1163,13 @@ def _run_xai_framework_local(self, prediction_id: str, model_id: str, method: st
 
         import asyncio
         async def async_task():
-            from app.db.mongo import connect_db, get_db
-            from app.services.model_loader_service import ModelLoaderService
-            import pandas as pd
-            import numpy as np
             from bson import ObjectId
             from datetime import datetime
             import traceback
+            from app.db.mongo import connect_db, get_db
 
-            # Dynamic import with fallback
+            await connect_db()
+            db = await get_db()
             try:
                 if method == "interpretml":
                     from app.services.interpretml_service import interpretml_service as service
@@ -1203,7 +1181,25 @@ def _run_xai_framework_local(self, prediction_id: str, model_id: str, method: st
                     raise ValueError(f"Unknown method {method}")
             except ImportError as ie:
                 logger.error(f"Framework import error for {method}: {ie}")
-                return {"status": "failed", "error": f"{method.upper()} library not installed or import error. Detailed error: {ie}"}
+                error_msg = f"{method.upper()} library not installed or import error. Detailed error: {ie}"
+                
+                # Save failure to database so UI can show it
+                explanation_doc = {
+                    "prediction_id": prediction_id,
+                    "model_id": model_id,
+                    "method": method,
+                    "explanation_type": "local",
+                    "task_id": self.request.id,
+                    "task_status": "failed",
+                    "error": error_msg,
+                    "created_at": datetime.utcnow()
+                }
+                await db.explanations.insert_one(explanation_doc)
+                return {"status": "failed", "error": error_msg}
+
+            from app.services.model_loader_service import ModelLoaderService
+            import pandas as pd
+            import numpy as np
 
             await connect_db()
             db = await get_db()
@@ -1216,24 +1212,57 @@ def _run_xai_framework_local(self, prediction_id: str, model_id: str, method: st
             model_obj, framework = await ModelLoaderService.load_model(model["file_path"])
             input_df = pd.DataFrame([prediction["input_data"]])
             
-            # Simple dummy background dataset for exact format requirements
+            # Align features with model schema if available to ensure correct order
+            if "feature_schema" in model and model["feature_schema"]:
+                try:
+                    input_df = _align_background_data(input_df, model)
+                    logger.info("Aligned input data with model schema")
+                except Exception as e:
+                    logger.warning(f"Failed to align input data: {e}")
+
+            # Improve background data generation (more samples for robust fitting)
+            # We also need to vary categorical columns so the model produces multiple
+            # prediction classes — required for BRCG to learn meaningful rules.
             training_df = input_df.copy()
-            for _ in range(50):
+            n_samples = 100 if method in ['alibi', 'aix360'] else 50
+
+            # Collect feature schema for categorical value ranges
+            feature_schema = model.get("feature_schema", [])
+            cat_value_map = {}
+            for fs in feature_schema:
+                vals = fs.get("categories") or fs.get("values") or fs.get("allowed_values")
+                if vals:
+                    cat_value_map[fs["name"]] = vals
+
+            for _ in range(n_samples):
                 noisy = input_df.copy()
                 for col in noisy.columns:
-                    if pd.api.types.is_numeric_dtype(noisy[col]):
-                        noisy[col] = noisy[col] + np.random.normal(0, max(float(noisy[col].iloc[0]) * 0.1, 1e-2))
+                    col_series = noisy[col]
+                    if pd.api.types.is_numeric_dtype(col_series):
+                        noise_std = max(float(abs(col_series.iloc[0])) * 0.1, 1e-2)
+                        noisy[col] = col_series + np.random.normal(0, noise_std)
+                    else:
+                        # For categorical columns: randomly sample from known values
+                        if col in cat_value_map and cat_value_map[col]:
+                            noisy[col] = np.random.choice(cat_value_map[col])
+                        # else leave as-is (no known categories)
                 training_df = pd.concat([training_df, noisy], ignore_index=True)
 
             task_type = "classification" if model.get("task_type") in ["classification", "binary_classification"] else "regression"
             
-            explainer = service.create_explainer(model_obj, framework, training_df, list(training_df.columns), mode=task_type)
+            # Explicitly pass arguments to avoid signature mismatches
+            explainer = service.create_explainer(
+                model=model_obj, 
+                framework=framework, 
+                training_data=training_df, 
+                feature_names=list(training_df.columns), 
+                mode=task_type
+            )
             
             local_exp_data = service.explain_instance(
-                explainer,
-                model_obj,
-                input_df.values[0],
-                num_features=num_features
+                explainer_obj=explainer,
+                instance=input_df.values[0],
+                feature_names=list(training_df.columns)
             )
 
             explanation_doc = {
@@ -1255,8 +1284,34 @@ def _run_xai_framework_local(self, prediction_id: str, model_id: str, method: st
         return asyncio.run(async_task())
     except Exception as e:
         import traceback
+        error_detail = str(e)
         logger.error(f"[{method} task failed] {traceback.format_exc()}")
-        return {"status": "failed", "error": str(e)}
+        
+        # Try to save general failure as well if possible
+        try:
+            import asyncio
+            from app.db.mongo import connect_db, get_db
+            from bson import ObjectId
+            from datetime import datetime
+
+            async def save_failure():
+                await connect_db()
+                db = await get_db()
+                await db.explanations.insert_one({
+                    "prediction_id": prediction_id,
+                    "model_id": model_id,
+                    "method": method,
+                    "explanation_type": "local",
+                    "task_id": self.request.id,
+                    "task_status": "failed",
+                    "error": error_detail,
+                    "created_at": datetime.utcnow()
+                })
+            asyncio.run(save_failure())
+        except:
+            pass
+            
+        return {"status": "failed", "error": error_detail}
 
 def _run_xai_framework_global(self, model_id: str, background_data_path: str, method: str, num_features: int = 10):
     try:
@@ -1297,7 +1352,7 @@ def _run_xai_framework_global(self, model_id: str, background_data_path: str, me
             
             # Load Background
             bg_bytes = await storage.download_file(background_data_path)
-            training_df = pd.read_csv(importlib.util.find_spec('io') and __import__('io').BytesIO(bg_bytes))
+            training_df = pd.read_csv(io.BytesIO(bg_bytes))
 
             task_type = "classification" if model.get("task_type") in ["classification", "binary_classification"] else "regression"
             
