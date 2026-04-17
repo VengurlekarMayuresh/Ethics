@@ -588,9 +588,16 @@ export default function UnifiedExplanationPage() {
                   ? prediction.prediction.toFixed(4)
                   : prediction.prediction}
               </p>
-              {prediction.probability && (
+              {/* Use prediction_confidence first (sanitized by backend), fallback to probability[0] or confidence calc */}
+              {(prediction.prediction_confidence !== undefined || prediction.probability !== undefined) && (
                 <p className="text-sm text-indigo-600 mt-1">
-                  Probability: {(prediction.probability * 100).toFixed(1)}%
+                  Probability: {(() => {
+                    const conf = prediction.prediction_confidence ?? 
+                                (Array.isArray(prediction.probability) 
+                                 ? Math.max(...prediction.probability.map(Number)) 
+                                 : Number(prediction.probability));
+                    return !isNaN(conf) ? (conf * 100).toFixed(1) + '%' : 'N/A';
+                  })()}
                 </p>
               )}
             </div>
