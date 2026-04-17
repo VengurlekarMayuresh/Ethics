@@ -5,10 +5,13 @@ import numpy as np
 import pandas as pd
 import onnxruntime
 import xgboost as xgb
-from typing import Any, Dict, List, Union
+import importlib
+import inspect
+from typing import Any, Dict, List, Union, Optional
 from pathlib import Path
 from app.utils.file_handler import storage
 from app.models.model_meta import FeatureSchema
+from app.config import settings
 
 class ModelLoader:
     """Framework-agnostic model loader for various ML frameworks."""
@@ -29,6 +32,33 @@ class ModelLoader:
         return cls.SUPPORTED_FORMATS.get(ext, "unknown")
 
     @classmethod
+    def _inject_custom_pickle_classes(cls) -> None:
+        """
+        Load user-configured modules and inject class symbols into __main__.
+        This helps unpickle sklearn/joblib models saved from notebook/script scopes.
+        """
+        modules_raw = (settings.PICKLE_CLASS_MODULES or "").strip()
+        if not modules_raw:
+            return
+
+        module_names = [m.strip() for m in modules_raw.split(",") if m.strip()]
+        if not module_names:
+            return
+
+        import __main__ as main_module
+
+        for module_name in module_names:
+            try:
+                module = importlib.import_module(module_name)
+                for symbol_name, symbol in vars(module).items():
+                    if symbol_name.startswith("_"):
+                        continue
+                    if inspect.isclass(symbol) and not hasattr(main_module, symbol_name):
+                        setattr(main_module, symbol_name, symbol)
+            except Exception as e:
+                print(f"Warning: Failed to import module {module_name} for pickle injection: {e}")
+
+    @classmethod
     async def load_model(cls, model_path: str) -> tuple[Any, str]:
         """Load model from storage and return model object with framework."""
         try:
@@ -37,7 +67,18 @@ class ModelLoader:
             framework = cls.detect_framework(model_path)
 
             if framework == "sklearn":
-                return joblib.load(io.BytesIO(model_file)), framework
+                try:
+                    cls._inject_custom_pickle_classes()
+                    return joblib.load(io.BytesIO(model_file)), framework
+                except Exception as e:
+                    msg = str(e)
+                    if "Can't get attribute" in msg:
+                        raise ValueError(
+                            "Missing custom class during unpickle. "
+                            "Check PICKLE_CLASS_MODULES in .env. "
+                            f"Original error: {msg}"
+                        )
+                    raise
             elif framework == "xgboost":
                 import xgboost as xgb
                 model = xgb.Booster()

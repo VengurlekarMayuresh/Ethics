@@ -379,11 +379,24 @@ class ModelLoaderService:
                 # We need to find the first step that knows about raw inputs.
 
                 raw_feature_step = None
+                derived_features_to_exclude = []
+                
                 for step_name, step in model_obj.steps:
+                    # Accumulate derived features from any step that defines them
+                    if hasattr(step, 'derived_features'):
+                        derived_features_to_exclude.extend(step.derived_features)
+
                     # Check if this step has raw_feature_names (custom attribute from FeatureEngineer)
-                    if hasattr(step, 'raw_feature_names'):
+                    if hasattr(step, 'raw_feature_names') and step.raw_feature_names:
                         raw_feature_step = step
                         break
+                    
+                    # Check if this step has numeric_features AND categorical_features attributes
+                    # (Fallback for class-level definitions if instance isn't fitted with names)
+                    if hasattr(step, 'numeric_features') and hasattr(step, 'categorical_features'):
+                        raw_feature_step = step
+                        break
+
                     # Check if this step has feature_names_in_ (sklearn automatically sets this
                     # when fit is called with a DataFrame). The first step with this is likely
                     # the raw input step.
@@ -397,10 +410,16 @@ class ModelLoaderService:
 
                 if raw_feature_step:
                     # Found a step with raw feature names
-                    if hasattr(raw_feature_step, 'raw_feature_names'):
+                    if hasattr(raw_feature_step, 'raw_feature_names') and raw_feature_step.raw_feature_names:
                         feature_names = raw_feature_step.raw_feature_names
+                    elif hasattr(raw_feature_step, 'numeric_features') and hasattr(raw_feature_step, 'categorical_features'):
+                        feature_names = raw_feature_step.numeric_features + raw_feature_step.categorical_features
                     else:
                         feature_names = raw_feature_step.feature_names_in_.tolist()
+                    
+                    # Filter out any features that we've identified as derived
+                    if derived_features_to_exclude:
+                        feature_names = [f for f in feature_names if f not in derived_features_to_exclude]
 
                     # Now infer feature types from the raw feature names and possibly from
                     # the subsequent preprocessing step if we can find it.
