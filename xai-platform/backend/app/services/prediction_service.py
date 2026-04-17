@@ -162,13 +162,23 @@ class PredictionService:
             else:
                 raise ValueError(f"Prediction not implemented for framework: {framework}")
 
-            # Prepare result
-            result = {
-                "prediction": prediction.tolist() if isinstance(prediction, (np.ndarray, list)) else prediction,
-                "probability": prediction_proba.tolist() if prediction_proba is not None else None
-            }
+            # Prepare result and sanitize for JSON/BSON serialization
+            # This prevents the 'NaN' issue caused by high-precision numpy floats
+            final_prediction = prediction.tolist() if isinstance(prediction, (np.ndarray, list)) else prediction
+            
+            sanitized_proba = None
+            if prediction_proba is not None:
+                # Handle both 1D and 2D probability arrays
+                safe_proba = np.nan_to_num(prediction_proba, nan=0.0)
+                if hasattr(safe_proba, "tolist"):
+                    sanitized_proba = safe_proba.tolist()
+                else:
+                    sanitized_proba = list(safe_proba)
 
-            return result
+            return {
+                "prediction": final_prediction,
+                "probability": sanitized_proba
+            }
 
         except Exception as e:
             raise ValueError(f"Prediction failed: {str(e)}")
@@ -176,21 +186,35 @@ class PredictionService:
     @staticmethod
     def format_prediction_result(result: Dict[str, Any], input_data: Dict[str, Any]) -> Dict[str, Any]:
         """Format prediction result for API response."""
+        probs = result.get("probability")
+        
+        # Flatten probabilities if they come in as [[p1, p2]]
+        if probs and isinstance(probs, list) and len(probs) > 0 and isinstance(probs[0], list):
+            probs = probs[0]
+
+        # Ensure all probabilities are clean floats for JSON/BSON
+        if probs:
+            probs = [float(np.nan_to_num(p, nan=0.0)) for p in probs]
+
+        final_prediction = result["prediction"]
+        if isinstance(final_prediction, (list, np.ndarray)) and len(final_prediction) > 0:
+            final_prediction = final_prediction[0]
+
         formatted = {
             "input_data": input_data,
-            "prediction": result["prediction"],
-            "prediction_label": result["prediction"] if isinstance(result["prediction"], (str, int, float)) else None,
-            "probabilities": result["probability"] if result["probability"] else None,
-            "prediction_confidence": None
+            "prediction": final_prediction,
+            "prediction_label": str(final_prediction),
+            "probabilities": probs,
+            "prediction_confidence": 0.0
         }
 
         # Calculate confidence if probabilities exist
         if formatted["probabilities"]:
-            if isinstance(formatted["probabilities"][0], list):
-                # Multi-class probabilities
-                formatted["prediction_confidence"] = max(formatted["probabilities"])
-            elif isinstance(formatted["probabilities"], list):
-                # Binary class probabilities - use positive class probability
-                formatted["prediction_confidence"] = formatted["probabilities"][-1]
+            try:
+                # Use max probability as the confidence score
+                formatted["prediction_confidence"] = float(np.nan_to_num(max(formatted["probabilities"]), nan=0.0))
+            except Exception as e:
+                print(f"Error calculating confidence: {e}")
+                formatted["prediction_confidence"] = 0.0
 
         return formatted

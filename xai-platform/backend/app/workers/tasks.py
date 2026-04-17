@@ -536,17 +536,28 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
                 logger.warning(f"[compute_lime_values] No background_data_path. Building synthetic background from input_data with Gaussian noise.")
                 training_df = input_df.copy()
 
-            # If training_df is too small, expand with Gaussian noise
-            if len(training_df) < 50:
-                logger.info(f"[compute_lime_values] training_df only has {len(training_df)} rows — expanding with Gaussian noise to 100 rows")
+            # If training_df is too small, expand with Intelligent Noise
+            if len(training_df) < 100:
+                logger.info(f"[compute_lime_values] training_df only has {len(training_df)} rows — expanding with intelligent noise to 500 rows")
                 base_df = training_df.copy()
                 rows = [base_df]
-                for _ in range(99):
+                
+                # Fetch feature schema for categorical options
+                feature_schema = {fs['name']: fs for fs in model.get('feature_schema', [])}
+                
+                for _ in range(499):
                     noisy = base_df.sample(1, replace=True).copy()
                     for col in noisy.columns:
+                        schema = feature_schema.get(col)
+                        
                         if pd.api.types.is_numeric_dtype(noisy[col]):
+                            # Gaussian noise for numerics
                             std = max(float(noisy[col].iloc[0]) * 0.2, 1e-3)
                             noisy[col] = noisy[col] + np.random.normal(0, std, size=len(noisy))
+                        elif schema and schema.get('type') == 'categorical' and schema.get('options'):
+                            # Random sampling from options for categorical to ensure variance
+                            noisy[col] = np.random.choice(schema['options'], size=len(noisy))
+                            
                     rows.append(noisy)
                 training_df = pd.concat(rows, ignore_index=True)
                 logger.info(f"[compute_lime_values] Expanded background: shape={training_df.shape}")
@@ -604,30 +615,34 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             # ── Sanitize LIME output for MongoDB (BSON requires string keys) ──
             # Extract raw explanation: list of (feature_str, float) tuples
             contributions = lime_data.get("explanation", [])
-            if not contributions:
-                logger.warning(f"[compute_lime_values] explanation is EMPTY. lime_data keys: {list(lime_data.keys())}")
-
+            
             # contributions: list of (feature_str, float) tuples → serialize as list of dicts
             contributions_safe = [
-                {"feature": str(feat), "weight": float(w)}
+                {"feature": str(feat), "weight": float(np.nan_to_num(w, nan=0.0))}
                 for feat, w in contributions
             ] if contributions else []
 
-            # intercept: LIME returns {class_int: float} → convert keys to strings
+            # intercept: LIME returns {class_int: float} or float
             raw_intercept = lime_data.get("intercept", {})
             if isinstance(raw_intercept, dict):
-                intercept_safe = {str(k): float(v) for k, v in raw_intercept.items()}
+                # Ensure keys are strings for MongoDB
+                intercept_safe = {str(k): float(np.nan_to_num(v, nan=0.0)) for k, v in raw_intercept.items()}
             else:
-                intercept_safe = float(raw_intercept) if raw_intercept is not None else None
+                intercept_safe = float(np.nan_to_num(raw_intercept, nan=0.0)) if raw_intercept is not None else 0.0
 
             # actual_prediction: true pipeline probabilities (list of floats per class)
             raw_actual_pred = lime_data.get("actual_prediction")
             if hasattr(raw_actual_pred, "tolist"):
-                local_pred_safe = raw_actual_pred.tolist()
+                local_pred_safe = [float(np.nan_to_num(v, nan=0.0)) for v in raw_actual_pred.tolist()]
             elif isinstance(raw_actual_pred, (list, tuple)):
-                local_pred_safe = [float(v) for v in raw_actual_pred]
+                local_pred_safe = [float(np.nan_to_num(v, nan=0.0)) for v in raw_actual_pred]
             else:
-                local_pred_safe = float(raw_actual_pred) if raw_actual_pred is not None else None
+                local_pred_safe = [float(np.nan_to_num(raw_actual_pred, nan=0.0))] if raw_actual_pred is not None else []
+            
+            # Extract confidence (max proba) for easier frontend display
+            prediction_confidence = 0.0
+            if local_pred_safe:
+                prediction_confidence = max(local_pred_safe)
 
             self.update_state(state="PROGRESS", meta={"status": "saving results", "progress": 90})
 
@@ -640,6 +655,7 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
                 "lime_weights": contributions_safe,
                 "lime_intercept": intercept_safe,
                 "lime_local_pred": local_pred_safe,
+                "prediction_confidence": prediction_confidence,
                 "explained_class": lime_data.get("explained_class"),
                 "explained_class_index": lime_data.get("explained_class_index"),
                 "feature_names": [str(f) for f in explainer_feature_names],
