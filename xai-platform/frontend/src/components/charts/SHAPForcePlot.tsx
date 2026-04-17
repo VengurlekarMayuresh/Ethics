@@ -196,17 +196,18 @@ const SHAPForcePlot: React.FC<SHAPForcePlotProps> = ({
       <div className="mt-3 pt-3 border-t border-gray-100">
         <p className="text-xs text-gray-500 mb-2 font-medium">Feature contributions</p>
         <div className="flex flex-wrap gap-x-5 gap-y-1.5">
-          {[...posSegs, ...negSegs]
+          {/* Show all features in legend, even if zero impact */}
+          {shapValues
             .sort((a, b) => Math.abs(b.value) - Math.abs(a.value))
-            .map((seg, i) => (
+            .map((s, i) => (
               <div key={i} className="flex items-center gap-1.5 text-xs">
                 <div
                   className="w-2.5 h-2.5 rounded-sm flex-shrink-0"
-                  style={{ backgroundColor: seg.value >= 0 ? '#f87171' : '#60a5fa' }}
+                  style={{ backgroundColor: s.value > 0 ? '#f87171' : (s.value < 0 ? '#60a5fa' : '#e5e7eb') }}
                 />
-                <span className="text-gray-700">{seg.feature}</span>
-                <span className={`font-mono font-semibold ${seg.value >= 0 ? 'text-red-600' : 'text-blue-600'}`}>
-                  {seg.value > 0 ? '+' : ''}{fmt(seg.value)}
+                <span className="text-gray-700">{s.feature}</span>
+                <span className={`font-mono font-semibold ${s.value > 0 ? 'text-red-600' : (s.value < 0 ? 'text-blue-600' : 'text-gray-400')}`}>
+                  {s.value > 0 ? '+' : ''}{fmt(s.value)}
                 </span>
               </div>
             ))}

@@ -23,6 +23,7 @@ interface LIMEPlotProps {
   data: LIMEWeight[];
   intercept?: number;
   localPred?: number;
+  explainedClass?: string;
   title?: string;
   height?: number;
 }
@@ -31,6 +32,7 @@ const LIMEPlot: React.FC<LIMEPlotProps> = ({
   data,
   intercept,
   localPred,
+  explainedClass,
   title = 'LIME Feature Contributions',
   height = 500,
 }) => {
@@ -77,7 +79,14 @@ const LIMEPlot: React.FC<LIMEPlotProps> = ({
   return (
     <div className="space-y-4">
       <div className="w-full bg-white rounded-lg border border-gray-200 p-4">
-        <h3 className="text-lg font-semibold mb-2">{title}</h3>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold">{title}</h3>
+          {explainedClass && (
+            <div className="px-3 py-1 bg-green-100 text-green-800 rounded-full text-xs font-bold border border-green-200 shadow-sm animate-pulse-subtle">
+              Target Outcome: {explainedClass}
+            </div>
+          )}
+        </div>
         <p className="text-xs text-gray-500 mb-4">
           Purple bars increase the prediction · Orange bars decrease it
         </p>
