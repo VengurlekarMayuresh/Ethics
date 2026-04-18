@@ -254,15 +254,8 @@ class LIMEService:
             actual_proba = model.predict_proba(raw_instance)[0]
 
         # Determine the target label
-        # INTUITION FIX: For binary classification (0=No, 1=Yes), always explain Class 1.
-        # This ensures signs are consistent: Positive weight always means "closer to Success/Yes".
-        # For multiclass, we still explain the predicted class for maximum insight into the actual decision.
-        
-        n_classes = len(actual_proba)
-        if n_classes == 2:
-            target_label = 1 # Force Positive Class (e.g. Approved, Survived)
-        else:
-            target_label = int(np.argmax(actual_proba))
+        # Explain the predicted class for maximum insight into the actual decision.
+        target_label = int(np.argmax(actual_proba))
 
         # Generate LIME explanation on the processed array
         exp = explainer.explain_instance(

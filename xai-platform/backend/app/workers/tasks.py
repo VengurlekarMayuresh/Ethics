@@ -630,19 +630,20 @@ def compute_lime_values(self, prediction_id: str, model_id: str, num_features: i
             else:
                 intercept_safe = float(np.nan_to_num(raw_intercept, nan=0.0)) if raw_intercept is not None else 0.0
 
-            # actual_prediction: true pipeline probabilities (list of floats per class)
-            raw_actual_pred = lime_data.get("actual_prediction")
-            if hasattr(raw_actual_pred, "tolist"):
-                local_pred_safe = [float(np.nan_to_num(v, nan=0.0)) for v in raw_actual_pred.tolist()]
-            elif isinstance(raw_actual_pred, (list, tuple)):
-                local_pred_safe = [float(np.nan_to_num(v, nan=0.0)) for v in raw_actual_pred]
+            # LIME local prediction: single value from the local surrogate model
+            raw_lime_local_pred = lime_data.get("lime_local_prediction")
+            if hasattr(raw_lime_local_pred, "tolist"):
+                local_pred_safe = [float(np.nan_to_num(v, nan=0.0)) for v in raw_lime_local_pred.tolist()]
+            elif isinstance(raw_lime_local_pred, (list, tuple)):
+                local_pred_safe = [float(np.nan_to_num(v, nan=0.0)) for v in raw_lime_local_pred]
             else:
-                local_pred_safe = [float(np.nan_to_num(raw_actual_pred, nan=0.0))] if raw_actual_pred is not None else []
-            
-            # Extract confidence (max proba) for easier frontend display
+                local_pred_safe = [float(np.nan_to_num(raw_lime_local_pred, nan=0.0))] if raw_lime_local_pred is not None else [0.0]
+
+            # Extract confidence (the LIME prediction value itself for binary classification)
+            # For binary classification, this is the probability of the positive class
             prediction_confidence = 0.0
             if local_pred_safe:
-                prediction_confidence = max(local_pred_safe)
+                prediction_confidence = local_pred_safe[0]  # Take the first (and usually only) value
 
             self.update_state(state="PROGRESS", meta={"status": "saving results", "progress": 90})
 
