@@ -21,7 +21,9 @@ class AlibiService:
         framework: str,
         training_data: pd.DataFrame,
         feature_names: List[str],
-        mode: str = "classification"
+        mode: str = "classification",
+        categorical_columns: List[str] = None,
+        categorical_labels: Dict[str, List[str]] = None
     ) -> Any:
         """
         Create an Alibi explainer (AnchorTabular for classification, KernelShap for regression).
@@ -201,28 +203,46 @@ class AlibiService:
                 }
             else:
                 # KernelShap
-                shap_values = explanation.data.get('shap_values', [[]])[0]
-                expected_value = explanation.data.get('expected_value', [0])[0]
+                try:
+                    shap_vals_raw = explanation.data.get('shap_values', [[]])
+                    if isinstance(shap_vals_raw, list) and len(shap_vals_raw) > 0:
+                        shap_values = np.array(shap_vals_raw[0])
+                    else:
+                        shap_values = np.array(shap_vals_raw)
+                        
+                    # Flatten the shap_values to a 1D array to handle any nesting
+                    shap_values = shap_values.flatten()
+                    
+                    expected_value = explanation.data.get('expected_value', [0])
+                    if isinstance(expected_value, list) and len(expected_value) > 0:
+                        expected_value = expected_value[0]
+                except Exception as ex:
+                    logger.error(f"Error extracting shap_values: {ex}")
+                    shap_values = np.zeros(len(feature_names))
+                    expected_value = 0.0
 
                 def _safe_float(val):
-                    if isinstance(val, (list, np.ndarray)):
-                        return float(val[0])
-                    return float(val)
+                    try:
+                        if isinstance(val, (list, np.ndarray)):
+                            return float(np.asarray(val).flatten()[0])
+                        return float(val)
+                    except:
+                        return 0.0
 
                 importance = sorted([
                     {"feature": feature_names[i] if i < len(feature_names) else f"feature_{i}",
-                     "importance": float(abs(v))}
+                     "importance": _safe_float(abs(v))}
                     for i, v in enumerate(shap_values)
                 ], key=lambda x: x["importance"], reverse=True)
 
                 return {
                     "intercept": _safe_float(expected_value),
                     "feature_importance": importance,
-                    "shap_values": [shap_values.tolist() if hasattr(shap_values, 'tolist') else shap_values],
+                    "shap_values": [shap_values.tolist()],
                     "expected_value": _safe_float(expected_value),
                     "list_of_contributions": [
-                        {"feature": feature_names[i], "weight": float(v),
-                         "value": float(instance_numeric[i]) if i < len(instance_numeric) else 0.0}
+                        {"feature": feature_names[i], "weight": _safe_float(v),
+                         "value": _safe_float(instance_numeric[i]) if i < len(instance_numeric) else 0.0}
                         for i, v in enumerate(shap_values)
                     ]
                 }

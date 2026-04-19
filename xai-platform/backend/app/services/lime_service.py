@@ -213,57 +213,74 @@ class LIMEService:
     ):
         """
         Generates a local LIME explanation aligned precisely with the Colab output.
+        Supports both classification and regression modes automatically.
         """
+        mode = getattr(explainer, "mode", "classification")
+        logger.info(f"Generating LIME explanation in {mode} mode")
+
         # Determine if we have a preprocessor to use
         has_preprocessor = hasattr(explainer, '_preprocessor') and explainer._preprocessor is not None
-        
-        # If we have a preprocessor, we SHOULD use it if the flag is set OR if the data looks non-numeric
         is_pipeline_flag = getattr(explainer, '_is_pipeline', False)
         
         should_preprocess = is_pipeline_flag
         if not should_preprocess and has_preprocessor:
-            # Check for non-numeric types in the raw instance
             for col in raw_instance.columns:
                 if not pd.api.types.is_numeric_dtype(raw_instance[col]):
                     should_preprocess = True
                     break
 
-        if should_preprocess and has_preprocessor:
-            try:
+        # Setup prediction function and actual value based on mode
+        try:
+            if should_preprocess and has_preprocessor:
                 processed_inst = explainer._preprocessor.transform(raw_instance)
                 if hasattr(processed_inst, "toarray"):
                     processed_inst = processed_inst.toarray()
                 instance_array = np.asarray(processed_inst[0], dtype=float)
                 
-                # If we were given a final estimator during creation, use it for LIME's neighborhood
-                if hasattr(explainer, '_final_estimator') and explainer._final_estimator:
-                    predict_fn = explainer._final_estimator.predict_proba
+                final_est = getattr(explainer, '_final_estimator', model)
+                if mode == "regression":
+                    predict_fn = final_est.predict
+                    actual_val = model.predict(raw_instance)[0]
+                else:
+                    predict_fn = final_est.predict_proba
+                    actual_val = model.predict_proba(raw_instance)[0]
+            else:
+                instance_array = np.asarray(raw_instance.iloc[0].values, dtype=float)
+                if mode == "regression":
+                    predict_fn = model.predict
+                    actual_val = model.predict(raw_instance)[0]
                 else:
                     predict_fn = model.predict_proba
-                
-                actual_proba = model.predict_proba(raw_instance)[0]
-            except Exception as e:
-                logger.error(f"LIME preprocessing failed: {e}")
-                # Last ditch fallback: try raw array
-                instance_array = raw_instance.iloc[0].values.astype(float)
-                predict_fn = model.predict_proba
-                actual_proba = model.predict_proba(raw_instance)[0]
+                    actual_val = model.predict_proba(raw_instance)[0]
+        except Exception as e:
+            logger.error(f"LIME setup failed: {e}")
+            # Fallback
+            instance_array = np.asarray(raw_instance.iloc[0].values, dtype=float)
+            if mode == "regression":
+                predict_fn = model.predict
+                actual_val = model.predict(raw_instance)[0] if hasattr(model, 'predict') else 0.0
+            else:
+                predict_fn = getattr(model, 'predict_proba', model.predict)
+                actual_val = model.predict_proba(raw_instance)[0] if hasattr(model, 'predict_proba') else [0.0]
+
+        # Generate LIME explanation
+        if mode == "regression":
+            # Regression doesn't use target labels
+            exp = explainer.explain_instance(
+                instance_array,
+                predict_fn,
+                num_features=num_features
+            )
+            target_label = 1 # LIME uses index 1 internally for regression output mapping
         else:
-            instance_array = raw_instance.iloc[0].values.astype(float)
-            predict_fn = model.predict_proba
-            actual_proba = model.predict_proba(raw_instance)[0]
-
-        # Determine the target label
-        # Explain the predicted class for maximum insight into the actual decision.
-        target_label = int(np.argmax(actual_proba))
-
-        # Generate LIME explanation on the processed array
-        exp = explainer.explain_instance(
-            instance_array,
-            predict_fn,
-            labels=(target_label,),
-            num_features=num_features
-        )
+            # Classification: Explain the predicted class
+            target_label = int(np.argmax(actual_val))
+            exp = explainer.explain_instance(
+                instance_array,
+                predict_fn,
+                labels=(target_label,),
+                num_features=num_features
+            )
 
         # Output extraction
         available_labels = list(exp.local_exp.keys())
@@ -272,9 +289,15 @@ class LIMEService:
 
         explanation_list = exp.as_list(label=target_label)
         
-        # Get class name safely
-        class_names = getattr(explainer, 'class_names', [])
-        explained_class_name = class_names[target_label] if target_label < len(class_names) else f"Class {target_label}"
+        # Sanitize actual value for UI
+        if mode == "regression":
+            actual_val_safe = float(np.nan_to_num(actual_val, nan=0.0))
+            explained_class_name = "Predicted Value"
+        else:
+            actual_val_safe = np.nan_to_num(actual_val, nan=0.0).tolist()
+            # Get class name safely
+            class_names = getattr(explainer, 'class_names', [])
+            explained_class_name = class_names[target_label] if target_label < len(class_names) else f"Class {target_label}"
 
         # ── Extract local_pred and intercept safely ──────────────────────────
         # Fix: Ensure values are standard floats to avoid NaN/serialization issues
@@ -290,8 +313,7 @@ class LIMEService:
         else:
             intercept_val = float(np.nan_to_num(exp.intercept, nan=0.0))
 
-        # Sanitize actual_proba to ensure no NaNs reach the UI
-        actual_proba_safe = np.nan_to_num(actual_proba, nan=0.0).tolist()
+        # actual_val_safe is already sanitized above
 
         # ── POST-PROCESS: Aggregate OHE bits into single clean features ─────────────────
         # This makes LIME as clear as SHAP and fixes the "Logic Reversal" sign confusion
@@ -348,13 +370,13 @@ class LIMEService:
 
         # ── Output extraction ────────────────────────────────────────────────────────
         return {
-            "actual_prediction"    : actual_proba_safe,
+            "actual_prediction"    : actual_val_safe,
             "lime_local_prediction": local_pred_val,
             "explanation"          : aggregated_explanation, # Clean, aggregated list
             "raw_explanation"      : explanation_list,       # Kept for debugging if needed
             "intercept"            : intercept_val,
             "explained_class"      : explained_class_name,
-            "explained_class_index": target_label
+            "explained_class_index": target_label if mode == "classification" else 0
         }
 
     @staticmethod
@@ -369,6 +391,7 @@ class LIMEService:
         """
         max_samples = min(20, len(samples))
 
+        mode = getattr(explainer, "mode", "classification")
         if getattr(explainer, '_is_pipeline', False):
             try:
                 processed_samples = explainer._preprocessor.transform(samples)
@@ -379,10 +402,16 @@ class LIMEService:
                 logger.error(f"Failed to preprocess global samples: {e}")
                 return {"error": str(e)}
             
-            predict_fn = explainer._final_estimator.predict_proba
+            if mode == "regression":
+                predict_fn = explainer._final_estimator.predict
+            else:
+                predict_fn = explainer._final_estimator.predict_proba
         else:
             processed_array = np.asarray(samples.values, dtype=float)
-            predict_fn = model.predict_proba
+            if mode == "regression":
+                predict_fn = model.predict
+            else:
+                predict_fn = model.predict_proba
 
         try:
             sp_obj = submodular_pick.SubmodularPick(

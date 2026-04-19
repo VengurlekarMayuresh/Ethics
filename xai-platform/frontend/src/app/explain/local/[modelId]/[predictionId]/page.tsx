@@ -21,7 +21,6 @@ import Link from 'next/link';
 import SHAPForcePlot from '@/components/charts/SHAPForcePlot';
 import LIMEPlot from '@/components/charts/LIMEPlot';
 import FeatureImportanceBar from '@/components/charts/FeatureImportanceBar';
-import AlibiRuleDisplay from '@/components/charts/AlibiRuleDisplay';
 import AIX360RuleDisplay from '@/components/charts/AIX360RuleDisplay';
 import { format } from 'date-fns';
 import ReactMarkdown from 'react-markdown';
@@ -68,7 +67,7 @@ interface LocalExplanation {
   error?: string;
 }
 
-type TabId = 'shap-force' | 'lime' | 'interpretml' | 'alibi' | 'aix360' | 'explanation';
+type TabId = 'shap-force' | 'lime' | 'interpretml' | 'aix360' | 'explanation';
 
 // ── ExplanationTab (AI NL generation) ────────────────────────────────────────
 
@@ -93,20 +92,47 @@ function ExplanationTab({
         shapValues = Array.isArray(raw[0]) ? (raw[0] as number[]) : (raw as number[]);
         shapFeatureNames = localShap.feature_names;
       }
+      let baseVal: number | undefined;
+      if (typeof localShap?.expected_value === 'number') baseVal = localShap.expected_value;
+      else if (Array.isArray(localShap?.expected_value)) baseVal = Number(localShap.expected_value[0]);
+
+      let limeW: { feature: string; weight: number }[] | undefined;
+      if (localLime?.lime_weights) {
+        limeW = localLime.lime_weights.map((item: any) => {
+          if (typeof item === 'object' && !Array.isArray(item) && 'feature' in item && 'weight' in item) {
+            return { feature: String(item.feature), weight: Number(item.weight) };
+          }
+          if (Array.isArray(item)) {
+            return { feature: String(item[0]), weight: Number(item[1]) };
+          }
+          return { feature: String(item), weight: 0 };
+        });
+      }
+
+      let limePred: number | undefined;
+      if (typeof localLime?.lime_local_pred === 'number') limePred = localLime.lime_local_pred;
+      else if (Array.isArray(localLime?.lime_local_pred)) limePred = Number(localLime.lime_local_pred[0]);
+
       const payload = {
         prediction_label: predictionLabel,
         prediction_value: predictionValue,
         shap_feature_names: shapFeatureNames,
         shap_values: shapValues,
-        shap_base_value: localShap?.expected_value ?? undefined,
-        lime_weights: localLime?.lime_weights ?? undefined,
-        lime_local_pred: localLime?.lime_local_pred ?? undefined,
+        shap_base_value: baseVal,
+        lime_weights: limeW,
+        lime_local_pred: limePred,
       };
       const { data } = await api.post('/explain/nl-generate', payload);
       setNlText(data.explanation);
       setSource(data.source);
     } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Failed to generate explanation.');
+      let errMsg = e?.response?.data?.detail;
+      if (!errMsg) {
+        errMsg = e.message || 'Failed to generate explanation.';
+      } else if (typeof errMsg !== 'string') {
+        errMsg = JSON.stringify(errMsg);
+      }
+      setError(errMsg);
     } finally {
       setLoading(false);
     }
@@ -365,29 +391,6 @@ export default function UnifiedExplanationPage() {
       },
     });
 
-  // ── NEW: Alibi local ──────────────────────────────────────────────────────
-  const { data: localAlibi, isLoading: localAlibiLoading } =
-    useQuery<LocalExplanation>({
-      queryKey: ['localExplanation', predictionId, 'alibi'],
-      queryFn: async () => {
-        try {
-          const { data } = await api.get(`/explain/prediction/${predictionId}?method=alibi`);
-          return data;
-        } catch (error: any) {
-          if (error.response?.status === 404) return null;
-          throw error;
-        }
-      },
-      enabled: activeTab === 'alibi' && !!predictionId,
-      retry: false,
-      refetchInterval: (query) => {
-        const d = query.state.data as LocalExplanation | null | undefined;
-        if (d?.explanation_data) return false;
-        if (activeTab !== 'alibi') return false;
-        return 5000;
-      },
-    });
-
   // ── NEW: AIX360 local ────────────────────────────────────────────────────
   const { data: localAix360, isLoading: localAix360Loading } =
     useQuery<LocalExplanation>({
@@ -442,18 +445,6 @@ export default function UnifiedExplanationPage() {
     },
   });
 
-  const requestAlibiMutation = useMutation({
-    mutationFn: async () => {
-      const { data } = await api.post(`/explain/alibi/${modelId}`, null, {
-        params: { prediction_id: predictionId },
-      });
-      return data;
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['localExplanation', predictionId, 'alibi'] });
-    },
-  });
-
   const requestAix360Mutation = useMutation({
     mutationFn: async () => {
       const { data } = await api.post(`/explain/aix360/${modelId}`, null, {
@@ -497,7 +488,6 @@ export default function UnifiedExplanationPage() {
     { id: 'shap-force', label: 'SHAP Force Plot', icon: BarChart3 },
     { id: 'lime', label: 'LIME', icon: Brain },
     { id: 'interpretml', label: 'InterpretML', icon: Cpu },
-    { id: 'alibi', label: 'Alibi', icon: Anchor },
     { id: 'aix360', label: 'AIX360', icon: BookOpen },
     { id: 'explanation', label: 'AI Explanation', icon: FileText },
   ];
@@ -507,7 +497,6 @@ export default function UnifiedExplanationPage() {
       case 'shap-force': return localShapLoading || localShap?.status === 'pending';
       case 'lime': return localLimeLoading || localLime?.status === 'pending';
       case 'interpretml': return localInterpretmlLoading || requestInterpretmlMutation.isPending;
-      case 'alibi': return localAlibiLoading || requestAlibiMutation.isPending;
       case 'aix360': return localAix360Loading || requestAix360Mutation.isPending;
       default: return false;
     }
@@ -855,44 +844,6 @@ export default function UnifiedExplanationPage() {
                     title="InterpretML — Feature Importance"
                     color="#0d9488"
                     height={400}
-                  />
-                </div>
-              );
-            }
-
-            // ── Alibi ────────────────────────────────────────────────────────
-            case 'alibi': {
-              if (localAlibiLoading || requestAlibiMutation.isPending) {
-                return (
-                  <div key={tab.id} className="flex h-64 items-center justify-center border-2 border-dashed border-gray-300 rounded-lg bg-gray-50">
-                    <div className="text-center">
-                      <Loader2 className="mx-auto h-10 w-10 animate-spin text-sky-500" />
-                      <h3 className="mt-4 text-lg font-semibold text-sky-800">Computing Alibi…</h3>
-                      <p className="mt-2 text-sky-700">This may take a few moments.</p>
-                    </div>
-                  </div>
-                );
-              }
-
-              if (!localAlibi?.explanation_data) {
-                return (
-                  <EmptyTabPrompt
-                    key={tab.id}
-                    label="Alibi"
-                    description="Alibi Anchor Explanations generate 'if-then' rules that describe the minimal conditions sufficient to reproduce this prediction. Includes precision and coverage metrics."
-                    color="#0ea5e9"
-                    icon={Anchor}
-                    onGenerate={() => requestAlibiMutation.mutate()}
-                    isPending={requestAlibiMutation.isPending}
-                  />
-                );
-              }
-
-              return (
-                <div key={tab.id}>
-                  <AlibiRuleDisplay
-                    explanationData={localAlibi.explanation_data as any}
-                    title="Alibi Explain — Anchor Rules (Local)"
                   />
                 </div>
               );

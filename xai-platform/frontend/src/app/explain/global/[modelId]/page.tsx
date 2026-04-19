@@ -22,11 +22,10 @@ import Link from 'next/link';
 import FeatureImportanceBar from '@/components/charts/FeatureImportanceBar';
 import SHAPBeeswarm from '@/components/charts/SHAPBeeswarm';
 import SHAPDependence from '@/components/charts/SHAPDependence';
-import AlibiRuleDisplay from '@/components/charts/AlibiRuleDisplay';
 import AIX360RuleDisplay from '@/components/charts/AIX360RuleDisplay';
 import { format } from 'date-fns';
 
-type FrameworkMethod = 'shap' | 'lime' | 'interpretml' | 'alibi' | 'aix360';
+type FrameworkMethod = 'shap' | 'lime' | 'interpretml' | 'aix360';
 
 interface GlobalExplanation {
   _id: string;
@@ -90,15 +89,6 @@ const FRAMEWORK_CONFIG: Record<
     icon: Cpu,
     postEndpoint: (id) => `/explain/interpretml/global/${id}`,
     getEndpoint: (id) => `/explain/interpretml/global/${id}/latest`,
-  },
-  alibi: {
-    label: 'Alibi',
-    color: '#0ea5e9',
-    activeClass: 'bg-sky-600 text-white',
-    inactiveClass: 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50',
-    icon: Anchor,
-    postEndpoint: (id) => `/explain/alibi/global/${id}`,
-    getEndpoint: (id) => `/explain/alibi/global/${id}/latest`,
   },
   aix360: {
     label: 'AIX360',
@@ -477,14 +467,6 @@ export default function GlobalExplanationPage() {
                 </div>
               )}
             </div>
-          )}
-
-          {/* ── Alibi ─────────────────────────────────────────────────────── */}
-          {requestMethod === 'alibi' && explanation.explanation_data && (
-            <AlibiRuleDisplay
-              explanationData={explanation.explanation_data as any}
-              title="Alibi Explain — Global Anchor/ALE"
-            />
           )}
 
           {/* ── AIX360 ───────────────────────────────────────────────────── */}
