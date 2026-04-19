@@ -26,6 +26,6 @@ joblib==1.4.2
 aiofiles==24.1.0
 httpx==0.27.0
 reportlab==4.2.5
-interpret>=0.6.0
+interpret==0.6.3
 alibi>=0.9.0
 aix360>=0.3.0

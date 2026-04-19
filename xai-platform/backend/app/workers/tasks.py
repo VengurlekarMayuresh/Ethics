@@ -1241,15 +1241,24 @@ def _run_xai_framework_local(self, prediction_id: str, model_id: str, method: st
             # We also need to vary categorical columns so the model produces multiple
             # prediction classes — required for BRCG to learn meaningful rules.
             training_df = input_df.copy()
-            n_samples = 100 if method in ['alibi', 'aix360'] else 50
+            # InterpretML, Alibi, and AIX360 benefit from more samples for stable local surrogates/rules
+            n_samples = 100 if method in ['alibi', 'aix360', 'interpretml'] else 50
 
-            # Collect feature schema for categorical value ranges
+            # Collect feature schema for categorical value ranges and explicit categorical types
             feature_schema = model.get("feature_schema", [])
             cat_value_map = {}
+            categorical_columns = []
+            
             for fs in feature_schema:
-                vals = fs.get("categories") or fs.get("values") or fs.get("allowed_values")
+                name = fs.get("name")
+                # Look for labels in various possible fields (options is the primary one from our Pydantic model)
+                vals = fs.get("options") or fs.get("categories") or fs.get("values") or fs.get("allowed_values")
                 if vals:
-                    cat_value_map[fs["name"]] = vals
+                    cat_value_map[name] = vals
+                
+                # Explicitly identify categorical columns from schema type
+                if fs.get("type") == "categorical":
+                    categorical_columns.append(name)
 
             for _ in range(n_samples):
                 noisy = input_df.copy()
@@ -1273,7 +1282,9 @@ def _run_xai_framework_local(self, prediction_id: str, model_id: str, method: st
                 framework=framework, 
                 training_data=training_df, 
                 feature_names=list(training_df.columns), 
-                mode=task_type
+                mode=task_type,
+                categorical_columns=categorical_columns,
+                categorical_labels=cat_value_map
             )
             
             local_exp_data = service.explain_instance(
