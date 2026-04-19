@@ -948,22 +948,22 @@ async def generate_nl_explanation(
     shap_lines: List[str] = []
     if body.shap_values and body.shap_feature_names:
         pairs = list(zip(body.shap_feature_names, body.shap_values))
-        top_shap = sorted(pairs, key=lambda x: abs(x[1]), reverse=True)[:7]
+        top_shap = sorted(pairs, key=lambda x: abs(x[1]), reverse=True)
         for fname, fval in top_shap:
-            direction = "↑ increases" if fval > 0 else "↓ decreases"
-            shap_lines.append(f"  • {fname}: SHAP={fval:+.4f}  ({direction} prediction)")
+            direction = "↑ positive impact (pushes score higher)" if fval > 0 else "↓ negative impact (pulls score lower)"
+            shap_lines.append(f"  • {fname}: SHAP value = {fval:+.4f}  ({direction})")
 
     # ── Build LIME contribution summary ──────────────────────────────────────
     lime_lines: List[str] = []
     if body.lime_weights:
-        top_lime = sorted(body.lime_weights, key=lambda x: abs(x.get("weight", 0)), reverse=True)[:7]
+        top_lime = sorted(body.lime_weights, key=lambda x: abs(x.get("weight", 0)), reverse=True)
         for item in top_lime:
             fname = item.get("feature", "?")
             w = item.get("weight", 0)
             val = item.get("value", "")
-            val_str = f" (value={val})" if val is not None and val != "" else ""
-            direction = "↑ increases" if w > 0 else "↓ decreases"
-            lime_lines.append(f"  • {fname}{val_str}: weight={w:+.4f}  ({direction} prediction)")
+            val_str = f" (feature value = {val})" if val is not None and val != "" else ""
+            direction = "↑ positive impact" if w > 0 else "↓ negative impact"
+            lime_lines.append(f"  • {fname}{val_str}: LIME weight = {w:+.4f}  ({direction})")
 
     pred_label = body.prediction_label or "Unknown"
     pred_val = f"{body.prediction_value:.4f}" if body.prediction_value is not None else "N/A"
@@ -972,45 +972,50 @@ async def generate_nl_explanation(
     shap_block = "\n".join(shap_lines) if shap_lines else "  (SHAP data not available)"
     lime_block = "\n".join(lime_lines) if lime_lines else "  (LIME data not available)"
 
-    prompt = f"""You are an AI explainability assistant. A machine learning model made the following prediction:
+    prompt = f"""You are an expert Machine Learning Engineer providing a highly nuanced, detailed explanation of a model's prediction.
 
-Prediction: {pred_label}  (score = {pred_val}, base value = {base_val})
-
-SHAP feature contributions (how much each feature pushed the score away from the base value):
-{shap_block}
-
-LIME feature contributions (local linear approximation around this prediction):
-{lime_block}
-
-Write a clear, 4-6 sentence explanation for a non-technical user that:
-1. States what the model predicted and the confidence
-2. Explains the top 3 most influential features and WHY they pushed the prediction in that direction
-3. Notes if SHAP and LIME agree or disagree on the top features
-4. Ends with a one-sentence summary of the overall reasoning
-
-Use plain English. Do not use jargon like "SHAP values" in the final summary — explain the concepts naturally."""
+    The model made the following prediction:
+    Predicted Class / Continuous Value: {pred_label} 
+    (Internal Model Score/Probability: {pred_val}, Baseline average: {base_val})
+    
+    SHAP Analysis (Exhaustive list of all features structured from highest to lowest impact):
+    {shap_block}
+    
+    LIME Analysis (Local linear behavior approximation):
+    {lime_block}
+    
+    Provide a deeply detailed, structured explanation that does the following:
+    1. **Prediction Overview**: State the model's conclusion clearly. Define whether this is a classification outcome or a continuous regression prediction.
+    2. **Detailed SHAP Breakdown**: Explain the SHAP feature graph. Detail **exactly** how much each top factor contributed to shifting the prediction away from the baseline average. Discuss why they pushed the score higher or lower.
+    3. **LIME Comparison**: Explain how LIME's local linear behavior supports or contradicts the SHAP factors. Describe what LIME tells us about the prediction's stability.
+    4. **Holistic Conclusion**: Summarize how these specific factors ultimately caused the prediction.
+    
+    Format clearly with markdown, using bolding and bullet points where appropriate to make the detailed numerical impacts readable."""
 
     # ── Try OpenRouter API ────────────────────────────────────────────────────
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if api_key:
+    from app.config import settings
+    openrouter_key = settings.OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY", "")
+    api_error = ""
+
+    if openrouter_key:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
-                        "Authorization": f"Bearer {api_key}",
+                        "Authorization": f"Bearer {openrouter_key}",
                         "Content-Type": "application/json",
                         "HTTP-Referer": "https://xai-platform",
                         "X-Title": "XAI Platform",
                     },
                     json={
-                        "model": "stepfun/step-3.5-flash:free",
+                        "model": "openai/gpt-oss-120b:free",
                         "messages": [
-                            {"role": "system", "content": "You are an AI explainability expert. Give clear, concise explanations."},
+                            {"role": "system", "content": "You are an AI explainability expert. Give clear, concise, well-formatted explanations."},
                             {"role": "user", "content": prompt}
                         ],
-                        "temperature": 0.4,
-                        "max_tokens": 400,
+                        "temperature": 0.3,
+                        "max_tokens": 500,
                     }
                 )
                 resp.raise_for_status()
@@ -1018,6 +1023,11 @@ Use plain English. Do not use jargon like "SHAP values" in the final summary —
                 text = data["choices"][0]["message"]["content"].strip()
                 return {"explanation": text, "source": "openrouter"}
         except Exception as e:
+            print(f"[OpenRouter Error]: {e}")
+            try:
+                api_error = f"(API Error details: {e} - {e.response.text})\n\n"
+            except:
+                api_error = f"(API Error details: {e})\n\n"
             # Fall through to template
             pass
 
@@ -1026,7 +1036,7 @@ Use plain English. Do not use jargon like "SHAP values" in the final summary —
     top_lime_name = body.lime_weights[0]["feature"] if body.lime_weights else "an unknown feature"
 
     template = (
-        f"The model predicted **{pred_label}** with a score of {pred_val} "
+        f"{api_error}The model predicted **{pred_label}** with a score of {pred_val} "
         f"(baseline average: {base_val}).\n\n"
         f"According to SHAP analysis, **{top_shap_name}** had the largest influence on this prediction. "
         f"LIME's local analysis also identifies **{top_lime_name}** as a key driver. "

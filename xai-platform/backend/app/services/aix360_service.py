@@ -39,7 +39,9 @@ class AIX360Service:
         framework: str,
         training_data: pd.DataFrame,
         feature_names: List[str],
-        mode: str = "classification"
+        mode: str = "classification",
+        categorical_columns: List[str] = None,
+        categorical_labels: Dict[str, List[str]] = None
     ) -> Any:
         """
         Initialize the AIX360 BRCG explainer as a surrogate rule-based model.
@@ -50,32 +52,51 @@ class AIX360Service:
             logger.error("AIX360 not installed in this environment.")
             return {"error": "AIX360 dependencies missing (aix360[all])", "stub": True}
 
-        if mode != "classification":
-            logger.warning("AIX360 BRCG only supports classification.")
-            return {"mode": mode, "stub": True, "error": "AIX360 BRCG only supports classification"}
+        # BRCG is classification-only, so for regression we discretize the target
+        discretize_regression = (mode == "regression")
 
         try:
-            # Build ordinal maps for any non-numeric columns
+            # Build ordinal maps using explicit categories if provided
             ordinal_maps = {}
-            for col in feature_names:
-                if not pd.api.types.is_numeric_dtype(training_data[col]):
-                    cats = sorted(training_data[col].astype(str).unique().tolist())
-                    ordinal_maps[col] = {cat: i for i, cat in enumerate(cats)}
+            cat_cols = categorical_columns if categorical_columns is not None else []
+            
+            # If no explicit list, detect non-numeric columns
+            if categorical_columns is None:
+                for col in feature_names:
+                    if col in training_data.columns and not pd.api.types.is_numeric_dtype(training_data[col]):
+                        cat_cols.append(col)
+
+            for col in cat_cols:
+                if col in training_data.columns:
+                    if categorical_labels and col in categorical_labels and categorical_labels[col]:
+                        labels = categorical_labels[col]
+                        ordinal_maps[col] = {str(cat): i for i, cat in enumerate(labels)}
+                    else:
+                        cats = sorted(training_data[col].astype(str).unique().tolist())
+                        ordinal_maps[col] = {cat: i for i, cat in enumerate(cats)}
 
             # Encode training data fully numeric
             X_numeric = _encode_df_numeric(training_data[feature_names], ordinal_maps)
 
             # Get model predictions to use as surrogate labels
             try:
-                y_pred = model.predict(training_data[feature_names])
+                y_raw = model.predict(training_data[feature_names])
             except Exception:
                 # Some models need a plain numeric array
-                y_pred = model.predict(X_numeric)
+                y_raw = model.predict(X_numeric)
 
-            y_pred = np.array(y_pred).astype(int)
+            y_raw = np.asarray(y_raw).flatten()
+            
+            # Regression strategy: Discretize y_raw around the median to create bit-rules
+            if discretize_regression:
+                median_val = np.median(y_raw)
+                y_pred = (y_raw > median_val).astype(int)
+                logger.info(f"Discretized regression target at median: {median_val}")
+            else:
+                y_pred = y_raw.astype(int)
 
             # BRCG requires BOTH classes present. If all predictions are the same class,
-            # randomly flip ~25% of samples so the surrogate has something to learn.
+            # randomly flip samples so the surrogate has something to learn.
             if len(np.unique(y_pred)) < 2:
                 logger.warning(
                     f"Only one predicted class ({np.unique(y_pred)}) in {len(y_pred)} samples. "
@@ -128,6 +149,40 @@ class AIX360Service:
             return {"error": str(e), "stub": True}
 
     @staticmethod
+    def _decode_rule_string(rule: str, ordinal_maps: Dict[str, Dict[str, int]]) -> str:
+        """Decode a rule string by replacing numeric indices with labels."""
+        import re
+        decoded = rule
+        for col, mapping in ordinal_maps.items():
+            if col in decoded:
+                # Reverse mapping: index -> label
+                reverse = {i: label for label, i in mapping.items()}
+                
+                # Match: col name + space? + operator + space? + float
+                pattern = rf"({re.escape(col)})\s*(==|<=|>=|>|<)\s*(\d+\.?\d*)"
+                
+                def replace_val(match):
+                    feature, op, val = match.groups()
+                    try:
+                        idx = int(round(float(val)))
+                        label = reverse.get(idx, val)
+                        
+                        # Make it more readable
+                        if op == "==":
+                            return f"{feature} is {label}"
+                        elif op == "<=" and idx == 0:
+                            return f"{feature} is {label}"
+                        elif op == ">=" and idx == len(reverse) - 1:
+                            return f"{feature} is {label}"
+                        
+                        return f"{feature} {op} {label}"
+                    except:
+                        return match.group(0)
+
+                decoded = re.sub(pattern, replace_val, decoded)
+        return decoded
+
+    @staticmethod
     def explain_instance(
         explainer_obj: Any,
         instance: np.ndarray,
@@ -162,9 +217,20 @@ class AIX360Service:
                 is_cnf = explanation_dict.get("isCNF", False)
 
                 for r in raw_rules:
+                    rule_str = str(r)
+                    # Attempt to decode rule string if orbital maps exist
+                    if explainer_obj.get("ordinal_maps"):
+                        rule_str = AIX360Service._decode_rule_string(rule_str, explainer_obj["ordinal_maps"])
+
+                    if explainer_obj.get("mode") == "regression":
+                        pred_label = "Above Median (High Value)" if not is_cnf else "Below Median (Low Value)"
+                    else:
+                        pred_label = "Positive (Class 1)" if not is_cnf else "Negative (Class 0)"
+
                     rules.append({
-                        "rule": str(r),
-                        "prediction": "Positive (Class 1)" if not is_cnf else "Negative (Class 0)",
+                        "rule": rule_str,
+                        "raw_rule": str(r),
+                        "prediction": pred_label,
                         "confidence": 0.9,
                         "support": round(1.0 / max(len(raw_rules), 1), 2)
                     })
